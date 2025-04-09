@@ -188,6 +188,12 @@ class Llama4Attention(nn.Module):
         is_gguf = quant_config and quant_config.get_name() == "gguf"
         if is_gguf and config.model_type == "llama":
             is_neox_style = False
+        
+        rope_scaling["factor"] = 16.0
+        rope_scaling["high_freq_factor"] = 1.0
+        rope_scaling["low_freq_factor"] = 1.0
+        rope_scaling["original_max_position_embeddings"] = 8192
+        print(f"Rope scaling: {rope_scaling}")
 
         self.rotary_emb = get_rope(
             self.head_dim,

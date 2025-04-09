@@ -5,6 +5,7 @@ import time
 import weakref
 from typing import TYPE_CHECKING, Optional, Union
 
+import time
 import numpy as np
 import torch
 import torch.distributed
@@ -13,7 +14,7 @@ import torch.nn as nn
 from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.layer import Attention
 from vllm.config import CompilationLevel, VllmConfig
-from vllm.distributed.parallel_state import get_pp_group, graph_capture
+from vllm.distributed.parallel_state import get_pp_group, graph_capture, get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -1259,6 +1260,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
             time_before_load = time.perf_counter()
             self.model = get_model(vllm_config=self.vllm_config)
+
+            # save model
+            logger.info("Starting to save model")
+            tp_rank = get_tensor_model_parallel_rank()
+            tp_size = get_tensor_model_parallel_world_size()
+            torch.save(self.model.state_dict(), f"./weights/model_tp{tp_size}_r{tp_rank}.pt")
+
             if self.lora_config:
                 self.model = self.load_lora_model(self.model,
                                                   self.model_config,
