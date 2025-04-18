@@ -70,9 +70,11 @@ class Llama4MoE(nn.Module):
                                        quant_config=None,
                                        prefix=f"{prefix}.router")
 
+        # TODO: retrieve from vll config
+        self.num_share_fusion_replicas = 1
         self.experts = FusedMoE(
-            num_experts=config.num_local_experts,
-            top_k=config.num_experts_per_tok,
+            num_experts=config.num_local_experts + self.num_share_fusion_replicas,
+            top_k=config.num_experts_per_tok + 1,
             hidden_size=config.hidden_size,
             custom_routing_function=Llama4MoE.custom_routing_function,
             intermediate_size=intermediate_size_moe,
@@ -94,12 +96,35 @@ class Llama4MoE(nn.Module):
 
     def forward(self, hidden_states):
         router_logits, _ = self.router(hidden_states)
-        shared_out = self.shared_expert(hidden_states)
-        routed_out = self.experts(
+        T, E = hidden_states.shape
+        # router_logits (T,E) -> (T+1, E)
+        if self.num_share_fusion_replicas > 0:
+            router_logits = torch.cat(
+                [
+                    router_logits,  # (T,E)
+                    # Use top-2 and append max score (inf) for the shared expert
+                    # so the shared expert is always routed to 
+                    # inf also ensures post-sigmoid router weight is 1.0 
+                    torch.full(
+                        (T, 1),
+                        torch.inf,
+                        dtype=router_logits.dtype,
+                        device=router_logits.device,
+                    )
+                ],
+                dim=1
+            )
+
+        if self.num_share_fusion_replicas == 0:
+            shared_out = self.shared_expert(hidden_states)
+        else:
+            shared_out = None
+        experts_out = self.experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
-        experts_out = routed_out + shared_out
+        if shared_out is not None:
+            experts_out += shared_out
 
         if self.tp_size > 1:
             experts_out = tensor_model_parallel_all_reduce(experts_out)
@@ -327,6 +352,8 @@ class Llama4Model(LlamaModel):
                  prefix: str = "",
                  layer_type: type[Llama4DecoderLayer] = Llama4DecoderLayer):
         self.num_experts = vllm_config.model_config.hf_config.num_local_experts
+        # TODO: retrieve from vll config
+        self.num_share_fusion_replicas = 1
         super().__init__(vllm_config=vllm_config,
                          prefix=prefix,
                          layer_type=layer_type)
@@ -413,6 +440,50 @@ class Llama4Model(LlamaModel):
             num_experts=1)
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
+
+        if self.num_share_fusion_replicas:
+            weights_dict = {k: v for (k, v) in list(weights)}
+
+            for moe_layer in range(self.config.num_hidden_layers):
+                for num_repeat in range(self.num_share_fusion_replicas):
+                    prefix = f"layers.{moe_layer}.feed_forward"
+                    expert_down_proj_key = f"{prefix}.experts.down_proj"
+
+                    # Fuse down proj  
+                    expert_down_proj_weight = weights_dict[
+                        expert_down_proj_key
+                    ] # [E, H, D]
+                    shared_expert_down_weight = weights_dict[
+                        f"{prefix}.shared_expert.down_proj.weight"
+                    ].transpose(-1,-2).unsqueeze(0) # [D, H]
+                    # Override expert weight
+                    weights_dict[expert_down_proj_key] = torch.cat(
+                        [expert_down_proj_weight, shared_expert_down_weight], 
+                        dim=0
+                    )
+
+                    # Fuse gate_up proj
+                    shared_expert_gate_proj = weights_dict[
+                        f"{prefix}.shared_expert.gate_proj.weight"
+                    ].transpose(-1,-2)
+                    shared_expert_up_proj = weights_dict[
+                        f"{prefix}.shared_expert.up_proj.weight"
+                    ].transpose(-1,-2)
+                    shared_expert_gate_up_weight = torch.cat(
+                        [shared_expert_gate_proj, shared_expert_up_proj], 
+                        dim=-1
+                    ).unsqueeze(0)
+
+                    expert_gate_up_proj_key = f"{prefix}.experts.gate_up_proj"
+                    expert_gate_up_w = weights_dict[expert_gate_up_proj_key]
+
+                    weights_dict[expert_gate_up_proj_key] = torch.cat(
+                        [expert_gate_up_w, shared_expert_gate_up_weight], 
+                        dim=0
+                    )
+
+            weights = list(weights_dict.items())
+
         for name, loaded_weight in weights:
             if "experts.gate_up_proj" in name or "experts.down_proj" in name:
                 fused_experts_params = True
