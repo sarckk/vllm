@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
+import random
 from collections.abc import Iterable
 from typing import Optional, Union
 
@@ -11,7 +12,11 @@ from torch import nn
 from transformers import Qwen2Config
 
 from vllm import LLM, SamplingParams
-from vllm.config import CacheConfig, VllmConfig
+from vllm.compilation.backends import set_model_tag
+from vllm.compilation.decorators import (ignore_torch_compile,
+                                         support_torch_compile)
+from vllm.config import (CacheConfig, CompilationConfig, CompilationLevel,
+                         VllmConfig)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -52,6 +57,7 @@ class Qwen2DecoderLayerWithKVSharing(nn.Module):
             target_layer_idx = layer_idx % 5
             kv_sharing_target_layer_name = f"{attn_prefix}.attn".replace(
                 str(layer_idx), str(target_layer_idx))
+
         self.self_attn = Qwen2Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -99,7 +105,104 @@ class Qwen2DecoderLayerWithKVSharing(nn.Module):
         return hidden_states, residual
 
 
+@support_torch_compile
+class FirstLayerGroup(nn.Module):
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        layers: list[nn.Module],
+    ):
+        super().__init__()
+        self.layers = layers
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ):
+        residual = None
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                residual,
+            )
+        return hidden_states, residual
+
+
+@support_torch_compile
+class SecondLayerGroup(nn.Module):
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        layers: list[nn.Module],
+    ):
+        super().__init__()
+        self.layers = layers
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ):
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                residual,
+            )
+        return hidden_states, residual
+
+
+@ignore_torch_compile
 class Qwen2ModelWithKVSharing(Qwen2Model):
+
+    def __init__(self,
+                 *,
+                 vllm_config: VllmConfig,
+                 prefix: str = "",
+                 decoder_layer_type: type[
+                     nn.Module] = Qwen2DecoderLayerWithKVSharing):
+        super().__init__(
+            vllm_config=vllm_config,
+            prefix=prefix,
+            decoder_layer_type=decoder_layer_type,
+        )
+
+        self.vllm_config = vllm_config
+
+        with set_model_tag("first_layer_group"):
+            self.first_layer_group = FirstLayerGroup(
+                vllm_config=vllm_config,
+                prefix=f"{prefix}.first_layer_group",
+                layers=self.layers[self.start_layer:START_KV_SHARING_LAYER],
+            )
+
+        with set_model_tag("second_layer_group"):
+            self.second_layer_group = SecondLayerGroup(
+                vllm_config=vllm_config,
+                prefix=f"{prefix}.second_layer_group",
+                layers=self.layers[START_KV_SHARING_LAYER:self.end_layer],
+            )
+
+        # Pre-allocate static buffers for CUDA graph
+        max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        dtype = vllm_config.model_config.dtype
+        device = next(self.parameters()).device
+        hidden_size = vllm_config.model_config.get_hidden_size()
+        self.residual = torch.zeros((max_num_tokens, hidden_size),
+                                    dtype=dtype,
+                                    device=device)
+        self.hidden_states = torch.zeros((max_num_tokens, hidden_size),
+                                         dtype=dtype,
+                                         device=device)
 
     def forward(
         self,
@@ -112,46 +215,51 @@ class Qwen2ModelWithKVSharing(Qwen2Model):
             hidden_states = inputs_embeds
         else:
             hidden_states = self.get_input_embeddings(input_ids)
-        residual = None
 
-        decode_indices = get_forward_context().decode_indices
-        if decode_indices is None:
-            decode_indices = torch.arange(positions.size(0),
-                                          device=positions.device)
+        num_input_tokens = input_ids.size(0)
+        self.hidden_states[:num_input_tokens].copy_(hidden_states)
 
-        # Forward with full inputs up to the first layer that shares KV cache
-        for layer in self.layers[self.start_layer:START_KV_SHARING_LAYER]:
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                residual,
-            )
+        first_hidden_states, first_residual = self.first_layer_group(
+            positions,
+            self.hidden_states[:num_input_tokens],
+        )
 
-        if decode_indices is not None:
-            decode_hidden_states = hidden_states[decode_indices]
-            decode_positions = positions[decode_indices]
-            decode_residual = (residual[decode_indices]
-                               if residual is not None else None)
-        else:
-            decode_hidden_states = hidden_states
-            decode_positions = positions
-            decode_residual = residual
+        generation_indices = get_forward_context().generation_indices
+        if generation_indices is None:
+            generation_indices = torch.arange(positions.size(0),
+                                              device=positions.device)
 
-        # Optimization: forward with partial inputs only for last N layers
-        for layer in self.layers[START_KV_SHARING_LAYER:self.end_layer]:
-            decode_hidden_states, decode_residual = layer(
-                decode_positions,
-                decode_hidden_states,
-                decode_residual,
-            )
+        num_decodes = generation_indices.shape[0]
+        assert num_decodes >= 1
+        assert first_residual is not None
+
+        # CUDA graph expects static tensor addresses
+        # Copy output of first layer group to second layer group
+        self.residual[:num_decodes].copy_(first_residual[generation_indices])
+        self.hidden_states[:num_decodes].copy_(
+            first_hidden_states[generation_indices])
+        positions[:num_decodes].copy_(positions[generation_indices])
+
+        second_hidden_states, second_residual = self.second_layer_group(
+            positions[:num_decodes],
+            self.hidden_states[:num_decodes],
+            self.residual[:num_decodes],
+        )
+
+        # NOTE(sarckk): Due to cudagraph padding, generation_indices may have
+        # trailing repeated indices. Attention output is only valid at the
+        # last index in this case.
+        last_index_mask = generation_indices == generation_indices[-1]
+        second_hidden_states[last_index_mask] = second_hidden_states[-1].clone(
+        )
+        second_residual[last_index_mask] = second_residual[-1].clone()
 
         # Merge results back
-        if decode_hidden_states is not None:
-            hidden_states[decode_indices] = decode_hidden_states
-            if residual is not None:
-                residual[decode_indices] = decode_residual
+        first_hidden_states[generation_indices] = second_hidden_states
+        if first_residual is not None:
+            first_residual[generation_indices] = second_residual
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, _ = self.norm(first_hidden_states, first_residual)
         return hidden_states
 
 
@@ -205,31 +313,74 @@ class TestQwen2ForCausalLM(nn.Module):
         return loader.load_weights(weights)
 
 
-# TODO: make it work with torch.compile
+@pytest.fixture
+def test_prompts():
+    """
+    Adapted from tests/v1/e2e/test_spec_decode.py
+    """
+    prompt_types = ["repeat", "sentence"]
+    # Setting higher num prompts increases the chance of numerics mismatch
+    # due to matrix multiplication numerics depending on batch dimension
+    num_prompts = 10
+    prompts = []
+
+    random.seed(0)
+    random_prompt_type_choices = random.choices(prompt_types, k=num_prompts)
+
+    for kind in random_prompt_type_choices:
+        word_choices = ["test", "temp", "hello", "where"]
+        word = random.choice(word_choices)
+        if kind == "repeat":
+            prompt = f"""please repeat the word '{word}' 10 times."""
+        elif kind == "sentence":
+            prompt = f"""please give a ten-word sentence that
+            uses the word {word} at least once."""
+        else:
+            raise ValueError(f"Unknown prompt type: {kind}")
+        prompts.append(prompt)
+
+    return prompts
+
+
 @fork_new_process_for_each_test
-@pytest.mark.parametrize("enforce_eager", [True])
-def test_kv_sharing_skip_prefill(monkeypatch, enforce_eager):
-    prompt = "What is the capital of France?"
+@pytest.mark.parametrize("enforce_eager", [True, False])
+def test_kv_sharing_skip_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+    enforce_eager: bool,
+    test_prompts: list[str],
+):
     ModelRegistry.register_model("Qwen2ForCausalLM", TestQwen2ForCausalLM)
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=40)
-    single_prompt = [prompt]
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=100)
+    compilation_config = CompilationConfig(
+        level=CompilationLevel.
+        PIECEWISE if not enforce_eager else CompilationLevel.NO_COMPILATION)
 
     with monkeypatch.context() as m:
         m.setenv("VLLM_USE_V1", "1")
 
-        llm = LLM(model="Qwen/Qwen2-1.5B-Instruct",
-                  enforce_eager=enforce_eager)
-        responses = llm.generate(single_prompt, sampling_params)
-        ref_output = responses[0].outputs[0].text
+        llm = LLM(
+            model="Qwen/Qwen2-1.5B-Instruct",
+            enforce_eager=enforce_eager,
+            compilation_config=compilation_config,
+        )
+        ref_responses = llm.generate(test_prompts, sampling_params)
 
         del llm
         gc.collect()
         torch.cuda.empty_cache()
 
-        m.setenv("VLLM_V1_KV_SHARING_SKIP_PREFILL", "1")
-
         llm = LLM(model="Qwen/Qwen2-1.5B-Instruct",
-                  enforce_eager=enforce_eager)
-        responses = llm.generate(single_prompt, sampling_params)
-        output = responses[0].outputs[0].text
-        assert output == ref_output
+                  enforce_eager=enforce_eager,
+                  compilation_config=compilation_config,
+                  kv_sharing_skip_prefill=True)
+        optimized_responses = llm.generate(test_prompts, sampling_params)
+
+        misses = 0
+
+        for ref_response, optimized_response in zip(ref_responses,
+                                                    optimized_responses):
+            if ref_response.outputs[0].text != optimized_response.outputs[
+                    0].text:
+                misses += 1
+
+        assert misses == 0
