@@ -343,3 +343,10 @@ def configure_quant_config(quant_config: QuantizationConfig,
             quant_config.apply_vllm_mapper(hf_to_vllm_mapper)
         if packed_mapping is not None:
             quant_config.packed_modules_mapping = packed_mapping
+
+
+def get_child_module_fqn(parent: nn.Module, child: nn.Module) -> str:
+    for name, module in parent.named_modules():
+        if module == child:
+            return name
+    raise Exception(f"Child module {child} not found in {parent}")

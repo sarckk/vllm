@@ -255,7 +255,11 @@ class DefaultModelLoader(BaseModelLoader):
 
     def load_weights(self, model: nn.Module,
                      model_config: ModelConfig) -> None:
-        weights_to_load = {name for name, _ in model.named_parameters()}
+        weights_to_load = super().get_expected_weights_to_load(
+            model,
+            model_config,
+        )
+
         loaded_weights = model.load_weights(
             self.get_all_weights(model_config, model))
         self.counter_after_loading_weights = time.perf_counter()

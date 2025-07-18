@@ -811,6 +811,14 @@ class Llama4ForConditionalGeneration(nn.Module, SupportsMultiModal,
 
         return self._process_image_input(image_input)
 
+    def get_mm_parameter_names(self) -> set[str]:
+        mm_params = {name for name, _ in self.vision_model.named_paramters()}
+        mm_params.update({
+            name
+            for name, _ in self.multi_modal_projector.named_parameters()
+        })
+        return mm_params
+
     def get_input_embeddings(
         self,
         input_ids: torch.Tensor,

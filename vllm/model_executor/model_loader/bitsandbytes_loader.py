@@ -737,7 +737,10 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 model_config.model,
                 model_config.revision,
             ))
-        weights_to_load = {name for name, _ in model.named_parameters()}
+        weights_to_load = super().get_expected_weights_to_load(
+            model,
+            model_config,
+        )
         loaded_weights = model.load_weights(qweight_iterator)
         # Some models may have weights loading tracker unimplemented.
         if loaded_weights is not None:

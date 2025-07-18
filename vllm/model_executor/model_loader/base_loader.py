@@ -8,7 +8,10 @@ import torch.nn as nn
 from vllm.config import LoadConfig, ModelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import (
-    initialize_model, process_weights_after_loading, set_default_torch_dtype)
+    get_child_module_fqn, initialize_model, process_weights_after_loading,
+    set_default_torch_dtype)
+from vllm.model_executor.models import SupportsMultiModal
+from vllm.multimodal import MULTIMODAL_REGISTRY
 
 logger = init_logger(__name__)
 
@@ -18,6 +21,7 @@ class BaseModelLoader(ABC):
 
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
+        self.mm_registry = MULTIMODAL_REGISTRY
 
     @abstractmethod
     def download_model(self, model_config: ModelConfig) -> None:
@@ -30,6 +34,27 @@ class BaseModelLoader(ABC):
         """Load weights into a model. This standalone API allows 
         inplace weights loading for an already-initialized model"""
         raise NotImplementedError
+
+    def get_expected_weights_to_load(self, model: nn.Module,
+                                     model_config: ModelConfig) -> set[str]:
+        """Get the expected weights to load into a model."""
+        weights_to_load = {name for name, _ in model.named_parameters()}
+
+        if isinstance(model, SupportsMultiModal):
+            mm_limits = self.mm_registry.get_mm_limits_per_prompt(model_config)
+            if sum(mm_limits.values()) == 0:
+                # We can skip loading multimodal weights if there is no
+                # multimodal input allowed.
+                language_model_fqn = get_child_module_fqn(
+                    model, model.get_language_model())
+                language_model_weights = {
+                    f"{language_model_fqn}.{name}"
+                    for name, _ in
+                    model.get_language_model().named_parameters()
+                }
+                return language_model_weights
+
+        return weights_to_load
 
     def load_model(self, vllm_config: VllmConfig,
                    model_config: ModelConfig) -> nn.Module:
