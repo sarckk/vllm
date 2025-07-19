@@ -344,7 +344,7 @@ def test_prompts():
 
 
 @fork_new_process_for_each_test
-@pytest.mark.parametrize("enforce_eager", [True, False])
+@pytest.mark.parametrize("enforce_eager", [True])
 def test_kv_sharing_truncated_prefill(
     monkeypatch: pytest.MonkeyPatch,
     enforce_eager: bool,

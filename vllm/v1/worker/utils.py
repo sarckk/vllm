@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec, TruncatedPrefillKVCacheGroupSpec, KVCacheSpec
 
 
 def sanity_check_mm_encoder_outputs(
@@ -79,7 +79,6 @@ def gather_mm_placeholders(
 
 
 def initialize_kv_cache_for_kv_sharing(
-    attn_layer_names: list[str],
     shared_kv_cache_layers: dict[str, str],
     kv_cache_groups: list[KVCacheGroupSpec],
     kv_caches: dict[str, torch.Tensor],
@@ -102,22 +101,16 @@ def initialize_kv_cache_for_kv_sharing(
             KV cache allocation.
     """
     # Record index of KV cache group for each layer that allocates a KV cache.
-    layer_to_kv_cache_group_idx: dict[str, int] = {}
-    for i, kv_cache_group in enumerate(kv_cache_groups):
+    layer_to_kv_cache_group: dict[str, KVCacheGroupSpec] = {}
+    kv_cache_spec_type_to_spec: dict[str, KVCacheSpec] = {}
+    for kv_cache_group in kv_cache_groups:
+        kv_cache_spec_type_to_spec[kv_cache_group.kv_cache_spec.type_id] = (
+            kv_cache_group.kv_cache_spec
+        )
         for layer_name in kv_cache_group.layer_names:
-            layer_to_kv_cache_group_idx[layer_name] = i
-
-    truncated_prefill_eligible_layers = set()
-    for layer_name in reversed(attn_layer_names):
-        if layer_name in shared_kv_cache_layers:
-            truncated_prefill_eligible_layers.add(layer_name)
-        else:
-            break
+            layer_to_kv_cache_group[layer_name] = kv_cache_group
 
     for layer_name, target_layer_name in shared_kv_cache_layers.items():
         kv_caches[layer_name] = kv_caches[target_layer_name]
-        group_idx = layer_to_kv_cache_group_idx[target_layer_name]
-        kv_cache_groups[group_idx].layer_names.append(layer_name)
-        if layer_name in truncated_prefill_eligible_layers:
-            kv_cache_groups[
-                group_idx].truncated_prefill_eligible_layers.append(layer_name)
+        kv_cache_group = layer_to_kv_cache_group[target_layer_name]
+        kv_cache_group.layer_names.append(layer_name)

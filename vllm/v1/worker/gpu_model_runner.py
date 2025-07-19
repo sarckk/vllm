@@ -5,6 +5,7 @@ import gc
 import time
 import weakref
 from contextlib import contextmanager
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
@@ -12,6 +13,7 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from tqdm import tqdm
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec, TruncatedPrefillKVCacheGroupSpec, KVCacheSpec
 
 import vllm.envs as envs
 from vllm.attention import AttentionType, get_attn_backend
@@ -162,7 +164,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
-        self.attn_metadata_builders: list[AttentionMetadataBuilder] = []
+        self.attn_metadata_builders: dict[str, AttentionMetadataBuilder] = {}
         self.attn_backends: list[type[AttentionBackend]] = []
         # self.kv_cache_config: KVCacheConfig
 
@@ -315,6 +317,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # means this layer will perform attention using the keys and values
         # from the KV cache of `shared_kv_cache_layers[layer_name]`.
         self.shared_kv_cache_layers: dict[str, str] = {}
+        self.kv_sharing_cache_group_updated = False
 
         self.generation_indices = None
         if self.cache_config.enable_kv_sharing_truncated_prefill:
@@ -332,8 +335,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         Args:
             scheduler_output: The scheduler output.
         """
-        self.attn_metadata_builders[0].reorder_batch(self.input_batch,
-                                                     scheduler_output)
+        cache_spec_type_ids = list(self.attn_metadata_builders.keys())
+        self.attn_metadata_builders[
+            cache_spec_type_ids[0]
+        ].reorder_batch(self.input_batch, scheduler_output)
 
         # For models with multiple KV cache groups, the groups should agree on
         # the same order of requests. We ensure this by only allowing the first
@@ -342,9 +347,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # TODO(tdoublep): make this more flexible so that any group can
         # re-order the batch (not only the first).
         # TODO(tdoublep): verify this during engine init instead of at runtime
-        for i in range(1, len(self.kv_cache_config.kv_cache_groups)):
-            batch_reordered = self.attn_metadata_builders[i].reorder_batch(
-                self.input_batch, scheduler_output)
+
+        # Ignore KVCacheGroupSpec created after initlaize_kv_cache()
+        # Only applies to certain layers in KV sharing setups
+        for cache_spec_type in cache_spec_type_ids[1:]:
+            batch_reordered = self.attn_metadata_builders[
+                cache_spec_type
+            ].reorder_batch(self.input_batch, scheduler_output)
             assert not batch_reordered
 
     # Note: used for model runner override.
@@ -596,7 +605,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return False
 
         for kv_cache_group_spec in self.kv_cache_config.kv_cache_groups:
-            if kv_cache_group_spec.truncated_prefill_eligible_layers:
+            if isinstance(kv_cache_group_spec, TruncatedPrefillKVCacheGroupSpec):
                 return True
 
         return False
@@ -714,6 +723,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Calculate the slot mapping for each KV cache group.
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
                 self.kv_cache_config.kv_cache_groups):
+            if isinstance(kv_cache_group_spec, TruncatedPrefillKVCacheGroupSpec):
+                # Ignore KVCacheGroupSpec created after initialize_kv_cache()
+                continue
+
             block_size = kv_cache_group_spec.kv_cache_spec.block_size
             block_table: BlockTable = self.input_batch.block_table[
                 kv_cache_group_id]
@@ -842,54 +855,57 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         attn_metadata: dict[str, Any] = {}
+        num_truncated_prefill_groups = len([
+            kv_cache_group for kv_cache_group in self.kv_cache_config.kv_cache_groups
+            if isinstance(kv_cache_group, TruncatedPrefillKVCacheGroupSpec)
+        ])
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
-        for kv_cache_group_id, kv_cache_group_spec in enumerate(
-                self.kv_cache_config.kv_cache_groups):
+        for kv_cache_group_id, kv_cache_group_spec in enumerate(reversed(self.kv_cache_config.kv_cache_groups)):
+            cache_type_id = kv_cache_group_spec.kv_cache_spec.type_id 
 
             # Prepare for cascade attention if enabled & beneficial.
             common_prefix_len = 0
-            builder = self.attn_metadata_builders[kv_cache_group_id]
+            builder = self.attn_metadata_builders[cache_type_id]
+
+            # NOTE(sarckk): len(kv_cache_config.kv_cache_groups) in model runner
+            # may be more than the number of kv cache groups in the scheduler 
+            # so we only use kv_cache_group_id for kv cache groups that were not
+            # added after initialize_kv_cache()
             if self.cascade_attn_enabled:
                 common_prefix_len = self._compute_cascade_attn_prefix_len(
                     num_scheduled_tokens,
                     scheduler_output.
-                    num_common_prefix_blocks[kv_cache_group_id],
+                    num_common_prefix_blocks[
+                        kv_cache_group_id - num_truncated_prefill_groups
+                    ],
                     kv_cache_group_spec.kv_cache_spec,
                     builder,
                 )
-
+            
             common_attn_metadata = common_attn_metadata
-            truncated_prefill_attn_metadata_i = None
-            if (truncated_prefill_common_attn_metadata is not None
-                    and kv_cache_group_spec.truncated_prefill_eligible_layers):
-                truncated_prefill_attn_metadata_i = (
-                    builder.build(
-                        # TODO(sarckk): Cascade attn for truncated prefill
-                        common_prefix_len=0,
-                        common_attn_metadata=(
-                            truncated_prefill_common_attn_metadata),
-                    ))
-
-            attn_metadata_i = (builder.build(
-                common_prefix_len=common_prefix_len,
-                common_attn_metadata=common_attn_metadata,
-            ))
+            if (
+                truncated_prefill_common_attn_metadata is not None
+                and isinstance(kv_cache_group_spec, TruncatedPrefillKVCacheGroupSpec)
+            ):
+                attn_metadata_i = builder.build(
+                    # TODO(sarckk): Cascade attn for truncated prefill
+                    common_prefix_len=0,
+                    common_attn_metadata=(
+                        truncated_prefill_common_attn_metadata),
+                )
+            else:
+                attn_metadata_i = (builder.build(
+                    common_prefix_len=common_prefix_len,
+                    common_attn_metadata=common_attn_metadata,
+                ))
 
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
 
-            if (kv_cache_group_spec.truncated_prefill_eligible_layers
-                    is not None
-                    and truncated_prefill_attn_metadata_i is not None):
-                for layer_name in \
-                    kv_cache_group_spec.truncated_prefill_eligible_layers:
-                    attn_metadata[layer_name] =\
-                        truncated_prefill_attn_metadata_i
-
         attention_cuda_graphs = all(
             b.can_run_in_cudagraph(common_attn_metadata)
-            for b in self.attn_metadata_builders)
+            for b in self.attn_metadata_builders.values())
 
         # Hot-Swap lora model
         if self.lora_config:
@@ -1400,6 +1416,65 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_logprobs_dict={},
             pooler_output=pooler_output,
         )
+    
+    def _maybe_reinitialize_kv_sharing_cache_groups(self) -> None:
+        if not self.shared_kv_cache_layers:
+            # Only applies if there is KV sharing involved
+            return        
+
+        if self.kv_sharing_cache_group_updated:
+            # Only need to perform re-initialization once
+            return
+
+        attn_layer_names = list(
+            get_layers_from_vllm_config(self.vllm_config, Attention)
+        )
+
+        layer_to_kv_cache_group: dict[str, KVCacheGroupSpec] = {}
+        kv_cache_spec_type_to_group: dict[str, KVCacheGroupSpec] = {}
+        for kv_cache_group in self.kv_cache_config.kv_cache_groups:
+            spec_type = kv_cache_group.kv_cache_spec.type_id
+            kv_cache_spec_type_to_group[spec_type] = kv_cache_group
+            for layer_name in kv_cache_group.layer_names:
+                layer_to_kv_cache_group[layer_name] = kv_cache_group
+
+        # Group layers by type_id of the KV cache group spec of the target layer
+        same_target_type_layers: dict[str, list[str]] = defaultdict(list)
+
+        for layer_name in reversed(attn_layer_names):
+            if layer_name in self.shared_kv_cache_layers:
+                target_layer_name = self.shared_kv_cache_layers[layer_name]
+                target_kv_cache_group = (
+                    layer_to_kv_cache_group[target_layer_name])
+                same_target_type_layers[
+                    target_kv_cache_group.kv_cache_spec.type_id
+                ].append(layer_name)
+            else:
+                break
+        
+        for spec_type, layer_names in same_target_type_layers.items():
+            kv_cache_group = kv_cache_spec_type_to_group[spec_type]
+            # Remove layer_names from their original kv cache groups
+            new_layer_names = []
+            layer_names_set = set(layer_names)
+            for layer_name in kv_cache_group.layer_names:
+                if layer_name not in layer_names_set:
+                    new_layer_names.append(layer_name)
+            # This assertion must hold true because at least one
+            # target KV layer must exist in the original KV cache group
+            assert len(new_layer_names) > 0
+            kv_cache_group.layer_names = new_layer_names
+
+            # Add new KV cache group for truncated prefill layers
+            self.kv_cache_config.kv_cache_groups.append(
+                TruncatedPrefillKVCacheGroupSpec(
+                    layer_names=layer_names,
+                    kv_cache_spec=kv_cache_group.kv_cache_spec
+                )
+            )
+        
+        self.kv_sharing_cache_group_updated = True
+        
 
     @torch.inference_mode()
     def execute_model(
@@ -1415,6 +1490,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Return empty ModelRunnerOutput if there's no work to do.
             return EMPTY_MODEL_RUNNER_OUTPUT
+        
+        self._maybe_reinitialize_kv_sharing_cache_groups()
 
         # Prepare the decoder inputs.
         (attn_metadata, attention_cuda_graphs, logits_indices,
@@ -2111,11 +2188,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_query_len=num_tokens,
             )
 
-            for kv_cache_group_id, kv_cache_group_spec in enumerate(
-                    self.kv_cache_config.kv_cache_groups):
-
+            for kv_cache_group_spec in self.kv_cache_config.kv_cache_groups:
+                kv_cache_spec_type_id = kv_cache_group_spec.kv_cache_spec.type_id
                 attn_metadata_i = self.attn_metadata_builders[
-                    kv_cache_group_id].build_for_cudagraph_capture(
+                    kv_cache_spec_type_id].build_for_cudagraph_capture(
                         common_attn_metadata)
                 for layer_name in kv_cache_group_spec.layer_names:
                     attn_metadata[layer_name] = attn_metadata_i
@@ -2477,7 +2553,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     f"full_cuda_graph or use a different attention backend.")
 
             self.attn_backends.append(attn_backend_i)
-            self.attn_metadata_builders.append(attn_metadata_builder_i)
+            self.attn_metadata_builders[kv_cache_spec.type_id] = (
+                attn_metadata_builder_i
+            )
 
     def may_reinitialize_input_batch(self,
                                      kv_cache_config: KVCacheConfig) -> None:
@@ -2673,10 +2751,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Setup `kv_cache_config` and `kv_caches` for models
         # with cross-layer KV sharing
         if self.shared_kv_cache_layers:
-            attn_layers = get_layers_from_vllm_config(self.vllm_config,
-                                                      Attention)
             initialize_kv_cache_for_kv_sharing(
-                list(attn_layers.keys()),
                 self.shared_kv_cache_layers,
                 kv_cache_config.kv_cache_groups,
                 kv_caches,

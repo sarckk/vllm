@@ -202,9 +202,11 @@ class KVCacheGroupSpec:
     layer_names: list[str]
     # The KV cache spec of this manager layer
     kv_cache_spec: KVCacheSpec
-    # The names of model layers for which prefill can be truncated
-    truncated_prefill_eligible_layers: list[str] = field(default_factory=list)
 
+
+@dataclass
+class TruncatedPrefillKVCacheGroupSpec(KVCacheGroupSpec):
+    ...
 
 @dataclass
 class KVCacheConfig:
