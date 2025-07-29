@@ -48,7 +48,7 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         GiB_bytes, LazyLoader, check_use_alibi, get_dtype_size,
                         is_pin_memory_available, round_up, supports_dynamo)
 from vllm.v1.attention.backends.mamba_selectors import get_mamba_attn_backend
-from vllm.v1.attention.backends.utils import (AttentionBackend, 
+from vllm.v1.attention.backends.utils import (AttentionBackend,
                                               AttentionMetadataBuilder,
                                               CommonAttentionMetadata,
                                               make_kv_sharing_fast_prefill_attention_metadata)
@@ -881,31 +881,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         attn_metadata[layer_name] = fast_prefill_metadata
                         continue
                     attn_metadata[layer_name] = attn_metadata_i
-
-            # Hack for now to fix chunked local attention + no hybrid kv cache
-            # manager we can remove this once
-            # https://github.com/vllm-project/vllm/pull/21588
-            # is merged (i.e. properly handle different attention backends for
-            # the same kv_cache_spec)
-            if self.attention_chunk_size is not None \
-                    and self.scheduler_config.disable_hybrid_kv_cache_manager:
-                if not hasattr(self, "local_attention_layers"):
-                    self.local_attention_layers = []
-                    attn_layers = get_layers_from_vllm_config(
-                        self.vllm_config, Attention)
-                    for layer_name, attn_module in attn_layers.items():
-                        if attn_module.use_irope:
-                            self.local_attention_layers.append(layer_name)
-
-                local_attn_metadata_i = (builder.build(
-                    common_prefix_len=0,
-                    common_attn_metadata=make_local_attention_virtual_batches(
-                        self.attention_chunk_size, common_attn_metadata,
-                        self.cache_config.block_size),
-                ))
-
-                for layer_name in self.local_attention_layers:
-                    attn_metadata[layer_name] = local_attn_metadata_i
 
         attention_cuda_graphs = all(
             g.attn_metadata_builder.can_run_in_cudagraph(common_attn_metadata)
@@ -2584,15 +2559,20 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         Initialize the attention backends and attention metadata builders.
         """
         attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
-                attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
-        def get_attn_backends_for_layers(layer_names: list[str]) -> dict[AttentionBackend, list[str]]:
+
+        def get_attn_backends_for_layers(
+                layer_names: list[str]
+        ) -> dict[type[AttentionBackend], list[str]]:
             attn_backends = defaultdict(list)
             for layer_name in layer_names:
-                attn_backends[attn_layers[layer_name].get_attn_backend()].append(layer_name)
+                attn_backends[attn_layers[layer_name].get_attn_backend(
+                )].append(layer_name)
             return attn_backends
 
-        def create_attn_groups(attn_backends_map: dict[AttentionBackend, list[str]]) -> AttentionGroup:
-            attn_groups = []
+        def create_attn_groups(
+            attn_backends_map: dict[AttentionBackend, list[str]]
+        ) -> list[AttentionGroup]:
+            attn_groups: list[AttentionGroup] = []
             for attn_backend, layer_names in attn_backends_map.items():
                 attn_metadata_builder_i = attn_backend.get_builder_cls()(
                     kv_cache_spec,
@@ -2603,7 +2583,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                             attn_metadata_builder_i,
                                             layer_names)
                 attn_groups.append(attn_group)
-                
+
                 if (self.full_cuda_graph and
                         not attn_metadata_builder_i.full_cudagraph_supported):
                     raise ValueError(
@@ -2612,16 +2592,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         f"full_cuda_graph or use a different attention backend."
                     )
             return attn_groups
-        
-        for kv_cache_group_id, kv_cache_group_spec in enumerate(
-                kv_cache_config.kv_cache_groups):
+
+        for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
             kv_cache_spec = kv_cache_group_spec.kv_cache_spec
-            attn_backends = defaultdict(list)
             if isinstance(kv_cache_spec, AttentionSpec):
                 attn_backends = get_attn_backends_for_layers(kv_cache_group_spec.layer_names)
             elif isinstance(kv_cache_spec, MambaSpec):
-                backend = get_mamba_attn_backend(kv_cache_spec.mamba_type)
-                attn_backends[backend] = kv_cache_group_spec.layer_names
+                attn_backends = {
+                    get_mamba_attn_backend(kv_cache_spec.mamba_type): 
+                        kv_cache_group_spec.layer_names
+                }
             else:
                 raise ValueError(
                     f"Unknown KV cache spec type: {type(kv_cache_spec)}")
@@ -2653,7 +2633,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if len(attn_specs) > 0:
             assert len(attn_specs) == len(attn_layers), \
                 "All or none of the layers are expected to be encoder-only"
-                
+
             attn_backends = get_attn_backends_for_layers(attn_layers.keys())
 
             self.attn_groups.append(create_attn_groups(attn_backends))
@@ -3010,7 +2990,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Use the first attention metadata builder
         # to create encoder attention metadata
-        builder = self.attn_metadata_builders[0]
+        builder = self.attn_groups[0][0].attn_metadata_builder
 
         dummy_block_table = torch.zeros((num_reqs, 1),
                                         dtype=torch.int32,
