@@ -35,10 +35,6 @@ class ChunkedLocalAttention(Attention):
             kv_cache_dtype = "auto"
             block_size = 16
 
-        # For v1 we have backend agnostic iRoPE (local chunked attention)
-        # we have to store the flag on the layer so gpu model runner can
-        # set KVSpec appropriately (and pop it so it doesnt get passed to
-        # the backends)
         if envs.VLLM_USE_V1:
             underlying_attn_backend = get_attn_backend(head_size, dtype,
                                                        kv_cache_dtype,
