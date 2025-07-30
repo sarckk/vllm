@@ -415,7 +415,7 @@ def subclass_attention_metadata_builder(
 ) -> type[AttentionMetadataBuilder[M]]:
     """
     Return a new subclass of `builder_cls` whose .build(...) method
-    first calls make_local_attention_virtual_batches(...) on the metadata.
+    first calls build_preprocess_fn(common_attn_metadata) on the metadata.
     """
     name: str = name_prefix + builder_cls.__name__  # type: ignore
 
@@ -441,8 +441,7 @@ def subclass_attention_backend(
     builder_cls: type[AttentionMetadataBuilder[M]]
 ) -> type[AttentionMetadataBuilder[M]]:
     """
-    Return a new subclass of `builder_cls` whose .build(...) method
-    first calls make_local_attention_virtual_batches(...) on the metadata.
+    Return a new subclass where `get_builder_cls` returns `builder_cls`.
     """
     name: str = name_prefix + builder_cls.__name__  # type: ignore
 
