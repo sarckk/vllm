@@ -354,12 +354,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # TODO(tdoublep): make this more flexible so that any group can
         # re-order the batch (not only the first).
         # TODO(tdoublep): verify this during engine init instead of at runtime
-        batch_reordered = False
-        for attn_group in itertools.chain.from_iterable(self.attn_groups):
-            group_reordered_batch = attn_group.attn_metadata_builder\
+
+        attn_groups_iterator = itertools.chain.from_iterable(self.attn_groups)
+        next(attn_groups_iterator).attn_metadata_builder.reorder_batch(
+            self.input_batch, scheduler_output)
+        for attn_group in attn_groups_iterator:
+            batch_reordered = attn_group.attn_metadata_builder\
                 .reorder_batch(self.input_batch, scheduler_output)
-            assert not batch_reordered or not group_reordered_batch
-            batch_reordered = batch_reordered or group_reordered_batch
+            assert not batch_reordered
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
