@@ -354,12 +354,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # TODO(tdoublep): make this more flexible so that any group can
         # re-order the batch (not only the first).
         # TODO(tdoublep): verify this during engine init instead of at runtime
-        batch_redordered = False
+        batch_reordered = False
         for attn_group in itertools.chain.from_iterable(self.attn_groups):
             group_reordered_batch = attn_group.attn_metadata_builder\
                 .reorder_batch(self.input_batch, scheduler_output)
-            assert not batch_redordered or not group_reordered_batch
-            batch_redordered = batch_redordered or group_reordered_batch
+            assert not batch_reordered or not group_reordered_batch
+            batch_reordered = batch_reordered or group_reordered_batch
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
@@ -2556,6 +2556,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         Initialize the attention backends and attention metadata builders.
         """
+        assert len(self.attn_groups) == 0, \
+            "Attention backends are already initialized"
         attn_layers = get_layers_from_vllm_config(self.vllm_config, Attention)
 
         def get_attn_backends_for_layers(
