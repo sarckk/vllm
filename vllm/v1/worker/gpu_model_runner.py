@@ -2724,7 +2724,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         kv_caches: dict[str, torch.Tensor] = {}
         has_attn, has_mamba = False, False
-        # TODO(lucas): clean up this for loop
         for kv_cache_spec, attn_group in self._attn_group_iterator():
             attn_backend = attn_group.attn_backend
             for layer_name in attn_group.layer_names:
