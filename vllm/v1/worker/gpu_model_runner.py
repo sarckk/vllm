@@ -47,10 +47,9 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         GiB_bytes, LazyLoader, check_use_alibi, get_dtype_size,
                         is_pin_memory_available, round_up, supports_dynamo)
 from vllm.v1.attention.backends.mamba_selectors import get_mamba_attn_backend
-from vllm.v1.attention.backends.utils import (AttentionBackend,
-                                              AttentionMetadataBuilder,
-                                              CommonAttentionMetadata,
-                                              make_kv_sharing_fast_prefill_attention_metadata)
+from vllm.v1.attention.backends.utils import (
+    AttentionBackend, AttentionMetadataBuilder, CommonAttentionMetadata,
+    make_kv_sharing_fast_prefill_attention_metadata)
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
 from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         ChunkedLocalAttentionSpec,
@@ -875,7 +874,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     )
 
                 for layer_name in attn_group.layer_names:
-                    if (self.cache_config.kv_sharing_fast_prefill and layer_name
+                    if (self.cache_config.kv_sharing_fast_prefill
+                            and layer_name
                             in self.kv_sharing_fast_prefill_eligible_layers):
                         attn_metadata[layer_name] = fast_prefill_metadata
                         continue

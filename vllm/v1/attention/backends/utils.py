@@ -4,7 +4,7 @@ import abc
 import functools
 from abc import abstractmethod
 from dataclasses import dataclass, make_dataclass
-from typing import (TYPE_CHECKING, Callable, ClassVar, Generic, Optional,
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Generic, Optional,
                     TypeVar)
 
 import numpy as np
