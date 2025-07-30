@@ -2596,11 +2596,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
             kv_cache_spec = kv_cache_group_spec.kv_cache_spec
             if isinstance(kv_cache_spec, AttentionSpec):
-                attn_backends = get_attn_backends_for_layers(kv_cache_group_spec.layer_names)
+                attn_backends = get_attn_backends_for_layers(
+                    kv_cache_group_spec.layer_names)
             elif isinstance(kv_cache_spec, MambaSpec):
                 attn_backends = {
-                    get_mamba_attn_backend(kv_cache_spec.mamba_type): 
-                        kv_cache_group_spec.layer_names
+                    get_mamba_attn_backend(kv_cache_spec.mamba_type):
+                    kv_cache_group_spec.layer_names
                 }
             else:
                 raise ValueError(
