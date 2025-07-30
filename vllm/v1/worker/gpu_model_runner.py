@@ -346,6 +346,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # for self.model_config.is_attention_free.
         if len(self.kv_cache_config.kv_cache_groups) == 0:
             return
+        attn_groups_iterator = itertools.chain.from_iterable(self.attn_groups)
+        next(attn_groups_iterator).attn_metadata_builder.reorder_batch(
+            self.input_batch, scheduler_output)
 
         # For models with multiple KV cache groups, the groups should agree on
         # the same order of requests. We ensure this by only allowing the first
@@ -354,10 +357,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # TODO(tdoublep): make this more flexible so that any group can
         # re-order the batch (not only the first).
         # TODO(tdoublep): verify this during engine init instead of at runtime
-
-        attn_groups_iterator = itertools.chain.from_iterable(self.attn_groups)
-        next(attn_groups_iterator).attn_metadata_builder.reorder_batch(
-            self.input_batch, scheduler_output)
         for attn_group in attn_groups_iterator:
             batch_reordered = attn_group.attn_metadata_builder\
                 .reorder_batch(self.input_batch, scheduler_output)
