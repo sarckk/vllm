@@ -346,6 +346,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # for self.model_config.is_attention_free.
         if len(self.kv_cache_config.kv_cache_groups) == 0:
             return
+
         attn_groups_iterator = itertools.chain.from_iterable(self.attn_groups)
         next(attn_groups_iterator).attn_metadata_builder.reorder_batch(
             self.input_batch, scheduler_output)
