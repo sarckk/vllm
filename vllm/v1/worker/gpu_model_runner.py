@@ -2575,6 +2575,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             for attn_backend, layer_names in attn_backends_map.items():
                 attn_metadata_builder_i = attn_backend.get_builder_cls()(
                     kv_cache_spec,
+                    layer_names,
                     self.vllm_config,
                     self.device,
                 )
