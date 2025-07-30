@@ -2598,6 +2598,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if isinstance(kv_cache_spec, AttentionSpec):
                 attn_backends = get_attn_backends_for_layers(
                     kv_cache_group_spec.layer_names)
+            # TODO(lucas): move `get_mamba_attn_backend` into the mamba
+            # layers like above
             elif isinstance(kv_cache_spec, MambaSpec):
                 attn_backends = {
                     get_mamba_attn_backend(kv_cache_spec.mamba_type):
@@ -2910,6 +2912,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 continue
 
             # TODO: Support other attention modules, e.g., cross-attention
+            # TODO(lucas): move the attention specs into the model layers like
+            #  the attention backends
             if attn_module.attn_type == AttentionType.DECODER:
                 if attn_module.sliding_window is not None:
                     kv_cache_spec[layer_name] = SlidingWindowSpec(
