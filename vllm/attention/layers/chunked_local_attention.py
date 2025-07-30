@@ -5,11 +5,11 @@ from typing import List, Optional
 import torch
 
 from vllm import envs
-from vllm.attention.backends.utils import (
-    make_local_attention_virtual_batches, subclass_attention_backend,
-    subclass_attention_metadata_builder)
 from vllm.attention.selector import get_attn_backend
 from vllm.config import CacheConfig, QuantizationConfig
+from vllm.v1.attention.backends.utils import (
+    make_local_attention_virtual_batches, subclass_attention_backend,
+    subclass_attention_metadata_builder)
 
 from ..layer import Attention
 
