@@ -17,8 +17,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
-from vllm.attention import AttentionType
-from vllm.attention.layer import Attention, ChunkedLocalAttention
+from vllm.attention import Attention, AttentionType, ChunkedLocalAttention
 from vllm.compilation.counter import compilation_counter
 from vllm.config import (CompilationLevel, VllmConfig,
                          get_layers_from_vllm_config, update_config)
