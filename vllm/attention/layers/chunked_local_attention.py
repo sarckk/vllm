@@ -54,6 +54,7 @@ class ChunkedLocalAttention(Attention):
                 attention_backend_cls=underlying_attn_backend,
                 builder_cls=builder_cls)
         else:
+            # in v0 the local attention is handled inside the backends
             attn_backend = None
 
         super().__init__(num_heads=num_heads,
