@@ -2565,11 +2565,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         def get_attn_backends_for_layers(
                 layer_names: list[str]
         ) -> dict[type[AttentionBackend], list[str]]:
-            attn_backends = defaultdict(list)
+            attn_backends = {}
+            attn_backend_layers = defaultdict(list)
+            # Dedupe based on full class name; this is a bit safer than using
+            # using the class itself as the key because when we create dynamic
+            # attention backend subclasses (e.g. ChunkedLocalAttention) unless
+            # they are cached correctly, there will be different objects per
+            # layer.
             for layer_name in layer_names:
-                attn_backends[attn_layers[layer_name].get_attn_backend(
-                )].append(layer_name)
-            return attn_backends
+                attn_backend = attn_layers[layer_name].get_attn_backend()
+                key = attn_backend.full_cls_name()
+                attn_backends[key] = attn_backend
+                attn_backend_layers[key].append(layer_name)
+            return {
+                attn_backends[k]: v
+                for k, v in attn_backend_layers.items()
+            }
 
         def create_attn_groups(
             attn_backends_map: dict[AttentionBackend, list[str]]

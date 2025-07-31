@@ -437,13 +437,13 @@ def subclass_attention_metadata_builder(
 
 
 def subclass_attention_backend(
-    name_prefix: str, attention_backend_cls: type[AttentionBackend],
-    builder_cls: type[AttentionMetadataBuilder[M]]
-) -> type[AttentionMetadataBuilder[M]]:
+        name_prefix: str, attention_backend_cls: type[AttentionBackend],
+        builder_cls: type[AttentionMetadataBuilder[M]]
+) -> type[AttentionBackend]:
     """
     Return a new subclass where `get_builder_cls` returns `builder_cls`.
     """
-    name: str = name_prefix + builder_cls.__name__  # type: ignore
+    name: str = name_prefix + attention_backend_cls.__name__  # type: ignore
 
     return type(name, (attention_backend_cls, ),
                 {"get_builder_cls": lambda: builder_cls})
