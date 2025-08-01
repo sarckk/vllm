@@ -2583,7 +2583,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             }
 
         def create_attn_groups(
-            attn_backends_map: dict[AttentionBackend, list[str]]
+            attn_backends_map: dict[AttentionBackend, list[str]],
+            kv_cache_spec: KVCacheSpec,
         ) -> list[AttentionGroup]:
             attn_groups: list[AttentionGroup] = []
             for attn_backend, layer_names in attn_backends_map.items():
@@ -2623,7 +2624,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 raise ValueError(
                     f"Unknown KV cache spec type: {type(kv_cache_spec)}")
 
-            self.attn_groups.append(create_attn_groups(attn_backends))
+            self.attn_groups.append(
+                create_attn_groups(attn_backends, kv_cache_spec))
 
         if len(self.attn_groups) > 0:
             return
@@ -2653,7 +2655,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             attn_backends = get_attn_backends_for_layers(attn_layers.keys())
 
-            self.attn_groups.append(create_attn_groups(attn_backends))
+            self.attn_groups.append(
+                create_attn_groups(attn_backends, attn_specs[0]))
             self.is_encoder_only_model = True
 
     def may_reinitialize_input_batch(self,
