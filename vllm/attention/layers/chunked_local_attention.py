@@ -21,7 +21,7 @@ def create_chunked_local_attention_backend(
     underlying_attn_backend: AttentionBackend,
     attention_chunk_size: int,
     block_size: int,
-) -> AttentionBackend:
+) -> type[AttentionBackend]:
     prefix = f"ChunkedLocalAttention_{attention_chunk_size}_{block_size}_"
 
     def build_preprocess_fn(cm: CommonAttentionMetadata):
