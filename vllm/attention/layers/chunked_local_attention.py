@@ -54,6 +54,7 @@ class ChunkedLocalAttention(Attention):
                  alibi_slopes: Optional[List[float]] = None,
                  cache_config: Optional[CacheConfig] = None,
                  quant_config: Optional[QuantizationConfig] = None,
+                 kv_sharing_target_layer_name: Optional[str] = None,
                  prefix: str = ""):
         dtype = torch.get_default_dtype()
         if cache_config is not None:
@@ -74,12 +75,14 @@ class ChunkedLocalAttention(Attention):
             # in v0 the local attention is handled inside the backends
             attn_backend = None
 
-        super().__init__(num_heads=num_heads,
-                         head_size=head_size,
-                         scale=scale,
-                         num_kv_heads=num_kv_heads,
-                         alibi_slopes=alibi_slopes,
-                         cache_config=cache_config,
-                         quant_config=quant_config,
-                         prefix=prefix,
-                         attn_backend=attn_backend)
+        super().__init__(
+            num_heads=num_heads,
+            head_size=head_size,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            alibi_slopes=alibi_slopes,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=prefix,
+            kv_sharing_target_layer_name=kv_sharing_target_layer_name,
+            attn_backend=attn_backend)
