@@ -17,13 +17,17 @@
 # limitations under the License.
 from collections.abc import Iterable
 from typing import Optional, Union
+import vllm.envs as envs
 
 import torch
 from torch import nn
 from transformers.models.gemma3n.configuration_gemma3n import Gemma3nTextConfig
+from vllm.forward_context import get_forward_context
 
 from vllm.attention import Attention
-from vllm.compilation.decorators import support_torch_compile
+from vllm.attention.layers.kv_sharing_cross_attention import KVSharingCrossAttention
+from vllm.compilation.decorators import ignore_torch_compile, support_torch_compile
+from vllm.compilation.backends import set_model_tag
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -344,7 +348,9 @@ class Gemma3nAttention(nn.Module):
             rope_scaling=rope_scaling,
         )
 
-        self.attn = Attention(
+        attn_class = KVSharingCrossAttention if self.is_kv_shared else Attention
+
+        self.attn = attn_class(
             num_heads=self.num_heads,
             head_size=self.head_dim,
             scale=1.0,
@@ -527,8 +533,38 @@ class Gemma3nDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class Gemma3nTextModel(nn.Module):
+class Gemma3nDecoder(nn.Module):
+    def __init__(
+        self, *, 
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        decoder_layers: list[Gemma3nDecoderLayer], 
+        layer_idx_start: int, 
+    ):
+        super().__init__()
+        self.decoder_layers = decoder_layers
+        self.layer_idx_start = layer_idx_start
 
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        per_layer_inputs: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        for idx, layer in enumerate(self.decoder_layers):
+            layer_idx = idx + self.layer_idx_start
+            # [altup_num_inputs, num_tokens, hidden_size]
+            hidden_states = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                per_layer_input=per_layer_inputs[:, layer_idx, :],
+                **kwargs,
+            )
+        return hidden_states
+
+@ignore_torch_compile
+class Gemma3nTextModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config.text_config
@@ -603,11 +639,41 @@ class Gemma3nTextModel(nn.Module):
             lambda prefix: Gemma3nDecoderLayer(
                 config, cache_config, quant_config, prefix=prefix),
             prefix=f"{prefix}.layers")
+        
+
+        first_kv_shared_layer_idx = (config.num_hidden_layers -
+                                     config.num_kv_shared_layers)
+        # Layer idx 0-19 are self-decoder layers in You Only Cache Once (YOCO)
+        with set_model_tag("self_decoder"):
+            self.self_decoder = Gemma3nDecoder(
+                vllm_config=vllm_config,
+                prefix=f"{prefix}.self_decoder",
+                decoder_layers=self.layers[:first_kv_shared_layer_idx],
+                layer_idx_start=0,
+            )
+        # Layer idx 20-30 are cross-decoder layers in YOCO
+        with set_model_tag("cross_decoder"):
+            self.cross_decoder = Gemma3nDecoder(
+                vllm_config=vllm_config,
+                prefix=f"{prefix}.cross_decoder",
+                decoder_layers=self.layers[first_kv_shared_layer_idx:],
+                layer_idx_start=first_kv_shared_layer_idx,
+            )
+
         self.norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
         )
         self.eps = torch.tensor(torch.finfo().min)
+
+        self.fast_prefill_enabled = (
+            cache_config.kv_sharing_fast_prefill and envs.VLLM_USE_V1)
+        
+        if self.fast_prefill_enabled:
+            # Let vLLM handle allocating and copying to static buffers
+            # required for CUDA graphs to work
+            vllm_config.compilation_config.cudagraph_copy_inputs = True
+            
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids) * self.embed_scale
@@ -667,16 +733,59 @@ class Gemma3nTextModel(nn.Module):
                 new_magnitude, self.eps)
         hidden_states = torch.stack(hidden_states, dim=0)
 
-        # Transformer blocks.
-        for layer_idx, layer in enumerate(self.layers):
-            # [altup_num_inputs, num_tokens, hidden_size]
-            hidden_states = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                per_layer_input=per_layer_inputs[:, layer_idx, :],
-                **kwargs,
+        logits_indices_padded = None
+        num_logits_indices = None
+        attn_metadata = get_forward_context().attn_metadata
+        # attn_metadata is None during dummy runs
+        if (attn_metadata is not None
+                and self.fast_prefill_enabled):
+            assert isinstance(attn_metadata, dict) 
+            # Last layer is a KV sharing layer
+            layer_attn_metadata = attn_metadata[
+                self.layers[-1].self_attn.attn.layer_name]
+            logits_indices_padded = layer_attn_metadata.logits_indices_padded
+            assert logits_indices_padded is not None
+            num_logits_indices = layer_attn_metadata.num_logits_indices
+            assert num_logits_indices > 0
+        
+        if logits_indices_padded is None:
+            logits_indices_padded = torch.arange(
+                positions.size(0),
+                dtype=positions.dtype,
+                device=positions.device,
             )
 
+        
+        self_decoder_hidden_states = self.self_decoder(
+            positions=positions,
+            hidden_states=hidden_states,
+            per_layer_inputs=per_layer_inputs,
+            **kwargs,
+        )
+
+        # NOTE(sarckk): IMPORTANT! Because vLLM shares a single graph pool
+        # among all CUDA graph captures, self_decoder_hidden_states
+        # will sometimes have its memory partially overriden by the cross
+        # decoder layer cuda graph replays as PyTorch tries to reuse the memory
+        # The .clone() here explicitly allocates new memory for these tensors
+        # so they are not overriden in the cross decoder layer call below.
+        hidden_states = self_decoder_hidden_states.clone()
+
+        cross_decoder_hidden_states = self.cross_decoder(
+            positions=positions[logits_indices_padded],
+            hidden_states=self_decoder_hidden_states[:, logits_indices_padded],
+            per_layer_inputs=per_layer_inputs[logits_indices_padded],
+            **kwargs,
+        )
+
+        # Merge cross-decoder hs back to self-decoder hs
+        if num_logits_indices is not None:
+            hidden_states[:, logits_indices_padded[:num_logits_indices]] = (
+                cross_decoder_hidden_states[:, :num_logits_indices]
+            ) 
+        else:
+            hidden_states = cross_decoder_hidden_states
+        
         # Altup unembed.
         target_magnitude = torch.mean(hidden_states[0]**2,
                                       dim=-1,
