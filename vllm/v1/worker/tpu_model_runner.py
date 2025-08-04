@@ -1675,8 +1675,11 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             initialize_kv_cache_for_kv_sharing(
                 self.shared_kv_cache_layers,
                 kv_cache_config.kv_cache_groups,
-                kv_caches,
             )
+            # KV caching setup
+            for layer_name, target_layer_name in (
+                    self.shared_kv_cache_layers.items()):
+                kv_caches[layer_name] = kv_caches[target_layer_name]
 
         bind_kv_cache(
             kv_caches,

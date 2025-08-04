@@ -120,6 +120,7 @@ def initialize_kv_cache_for_kv_sharing(
         group_idx = layer_to_kv_cache_group_idx[target_layer_name]
         kv_cache_groups[group_idx].layer_names.append(layer_name)
 
+
 def bind_kv_cache(
     kv_caches: dict[str, torch.Tensor],
     forward_context: dict[str, "Attention"],
@@ -163,3 +164,14 @@ def bind_kv_cache(
     for layer_name, kv_cache in kv_caches.items():
         # NOTE: Use list because of v0 PP virtual engine.
         forward_context[layer_name].kv_cache = [kv_cache]
+
+
+class KVSharingFastPrefillAttentionBackend:
+    pass
+
+
+def is_kv_sharing_attn_group(attn_group: AttentionGroup) -> bool:
+    for base_cls in attn_group.attn_backend.__bases__:
+        if base_cls is type(KVSharingFastPrefillAttentionBackend):
+            return True
+    return False

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import fields
 import gc
 import itertools
 import time
@@ -49,7 +48,7 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
 from vllm.v1.attention.backends.mamba_selectors import get_mamba_attn_backend
 from vllm.v1.attention.backends.utils import (
     AttentionBackend, AttentionMetadataBuilder, CommonAttentionMetadata,
-    make_kv_sharing_fast_prefill_attention_metadata)
+    create_fast_prefill_attention_metadata)
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
 from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         ChunkedLocalAttentionSpec,
@@ -74,7 +73,8 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from ..sample.logits_processor import LogitsProcessorManager
 from .utils import (AttentionGroup, bind_kv_cache, gather_mm_placeholders,
                     initialize_kv_cache_for_kv_sharing,
-                    sanity_check_mm_encoder_outputs, scatter_mm_placeholders)
+                    is_kv_sharing_attn_group, sanity_check_mm_encoder_outputs,
+                    scatter_mm_placeholders)
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -89,11 +89,6 @@ else:
         "xgrammar.kernels.apply_token_bitmask_inplace_torch_compile")
 
 logger = init_logger(__name__)
-
-
-def is_kv_sharing_attn_group(attn_group: AttentionGroup) -> bool:
-    # TODO(sarckk): a less hacky way to determine if KV sharing attn group
-    return attn_group.attn_backend.__name__.startswith("KVSharing")
 
 
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
@@ -865,21 +860,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 ))
 
                 if (self.cache_config.kv_sharing_fast_prefill
-                    and is_kv_sharing_attn_group(attn_group)):
-                    # Dynamically create a a dataclass type that inherits
-                    # from attention metadata type but includes additional
-                    # fields logits_indices_padded and num_logits_indices
-                    # which are required for prefill truncation
-                    fast_prefill_metadata_type = (
-                        make_kv_sharing_fast_prefill_attention_metadata(
-                            metadata_cls=type(attn_metadata_i), ))
-                    # Avoid deepcopy caused by dict.asdict
-                    attn_metadata_fields = {}
-                    for field in fields(attn_metadata_i.__class__):
-                        attn_metadata_fields[field.name] = getattr(attn_metadata_i, field.name)
-                    attn_metadata_i = fast_prefill_metadata_type(
-                        **attn_metadata_fields,
-                        logits_indices_padded=logits_indices_padded,
+                        and is_kv_sharing_attn_group(attn_group)):
+                    attn_metadata_i = create_fast_prefill_attention_metadata(
+                        attn_metadata_i,
+                        logits_indices_padded,
                         num_logits_indices=logits_indices.size(0),
                     )
 
@@ -2715,7 +2699,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
             layer_names.update(group.layer_names)
-        kv_allocating_layers = layer_names - set(self.shared_kv_cache_layers.keys())
+        kv_allocating_layers = layer_names - set(
+            self.shared_kv_cache_layers.keys())
         assert kv_allocating_layers == set(kv_cache_raw_tensors.keys(
         )), "Some layers are not correctly initialized"
         return kv_cache_raw_tensors
@@ -2863,14 +2848,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                                    kv_cache_raw_tensors)
 
         # KV caching setup
-        for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
+        for layer_name, target_layer_name in self.shared_kv_cache_layers.items(
+        ):
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
         bind_kv_cache(kv_caches,
                       self.compilation_config.static_forward_context,
                       self.kv_caches)
         return kv_caches
-    
+
     def initialize_kv_sharing(self, kv_cache_config: KVCacheConfig) -> None:
         # Setup `kv_cache_config` and `kv_caches` for models
         # with cross-layer KV sharing
@@ -2890,7 +2876,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         self.kv_cache_config = kv_cache_config
         self.may_reinitialize_input_batch(kv_cache_config)
-
         self.initialize_kv_sharing(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)

@@ -3,13 +3,16 @@
 import abc
 import functools
 from abc import abstractmethod
-from dataclasses import dataclass, make_dataclass
+from collections.abc import Hashable
+from dataclasses import dataclass, fields, make_dataclass
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Generic, Optional,
-                    TypeVar)
+                    Protocol, TypeVar)
 
 import numpy as np
 import torch
+from typing_extensions import runtime_checkable
 
+from vllm.attention.backends.abstract import AttentionBackend
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.utils import cdiv
 
@@ -20,7 +23,6 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
 import vllm.envs as envs
-from vllm.attention.backends.abstract import AttentionBackend
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     get_kv_connector_cache_layout)
 from vllm.logger import init_logger
@@ -60,10 +62,10 @@ class CommonAttentionMetadata:
 
     block_table_tensor: torch.Tensor
     slot_mapping: torch.Tensor
-    logits_indices: torch.Tensor
+
+    logits_indices: Optional[torch.Tensor] = None
 
     causal: bool = True
-    
 
 
 M = TypeVar("M")
@@ -440,8 +442,9 @@ def subclass_attention_metadata_builder(
 
 
 def subclass_attention_backend(
-        name_prefix: str, attention_backend_cls: type[AttentionBackend],
-        builder_cls: type[AttentionMetadataBuilder[M]]
+    name_prefix: str,
+    attention_backend_cls: type[AttentionBackend],
+    builder_cls: type[AttentionMetadataBuilder[M]],
 ) -> type[AttentionBackend]:
     """
     Return a new subclass where `get_builder_cls` returns `builder_cls`.
@@ -578,7 +581,7 @@ def subclass_attention_metadata(
 
 @functools.cache
 def make_kv_sharing_fast_prefill_attention_metadata(
-    metadata_cls: Any, ) -> Any:
+    metadata_cls: Hashable, ) -> Any:
     """
     Return a new subclass of `metadata_cls` for fast prefill
     """
@@ -587,3 +590,66 @@ def make_kv_sharing_fast_prefill_attention_metadata(
         metadata_cls=metadata_cls,
         fields=KV_SHARING_FAST_PREFILL_METADATA_FIELDS,
     )
+
+
+def create_fast_prefill_attention_metadata(
+    attn_metadata_i: Any,
+    logits_indices_padded: torch.Tensor,
+    num_logits_indices: int,
+):
+    # Dynamically create a a dataclass type that inherits
+    # from attention metadata type but includes additional
+    # fields logits_indices_padded and num_logits_indices
+    # which are required for prefill truncation
+    fast_prefill_metadata_type = (
+        make_kv_sharing_fast_prefill_attention_metadata(
+            metadata_cls=type(attn_metadata_i), ))
+
+    # Make attention metadata type inherit
+    # KVSharingFastPrefillAttentionMetadata type
+    fast_prefill_metadata_type = type(
+        fast_prefill_metadata_type.__name__,
+        (
+            fast_prefill_metadata_type,
+            KVSharingFastPrefillAttentionMetadata,
+        ),
+        {},
+    )
+    # Avoid deepcopy caused by dict.asdict
+    attn_metadata_fields = {}
+    for field in fields(attn_metadata_i.__class__):
+        attn_metadata_fields[field.name] = getattr(attn_metadata_i, field.name)
+    attn_metadata_i = fast_prefill_metadata_type(
+        **attn_metadata_fields,
+        logits_indices_padded=logits_indices_padded,
+        num_logits_indices=num_logits_indices,
+    )
+    return attn_metadata_i
+
+
+@runtime_checkable
+class KVSharingFastPrefillAttentionMetadata(Protocol):
+    logits_indices_padded: torch.Tensor
+    num_logits_indices: int
+
+
+@functools.lru_cache
+def create_custom_attention_backend(
+    prefix: str,
+    underlying_attn_backend: AttentionBackend,
+    build_preprocess_fn: Callable[[CommonAttentionMetadata],
+                                  CommonAttentionMetadata],
+) -> type[AttentionBackend]:
+    # Dynamically create a new attention backend that wraps the
+    # underlying attention backend but applies
+    # `build_preproces_fn` before calling `build(...)`
+    builder_cls = subclass_attention_metadata_builder(
+        name_prefix=prefix,
+        builder_cls=underlying_attn_backend.get_builder_cls(),
+        build_preprocess_fn=build_preprocess_fn)
+    attn_backend = subclass_attention_backend(
+        name_prefix=prefix,
+        attention_backend_cls=underlying_attn_backend,
+        builder_cls=builder_cls)
+
+    return attn_backend

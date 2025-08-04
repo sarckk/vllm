@@ -3,18 +3,12 @@
 
 import gc
 import random
-from typing import Optional, Union
 
 import pytest
 import torch
 
 from vllm import LLM, SamplingParams
 from vllm.config import CompilationConfig, CompilationLevel
-from vllm.forward_context import get_forward_context
-from vllm.model_executor.models.gemma3n import Gemma3nForConditionalGeneration
-from vllm.model_executor.models.registry import ModelRegistry
-from vllm.model_executor.models.utils import extract_layer_index
-from vllm.sequence import IntermediateTensors
 
 from ...utils import fork_new_process_for_each_test
 

@@ -7,12 +7,11 @@ import torch
 from vllm import envs
 from vllm.attention.selector import get_attn_backend
 from vllm.config import CacheConfig, QuantizationConfig
+from vllm.v1.attention.backends.utils import (
+    CommonAttentionMetadata, create_custom_attention_backend,
+    make_local_attention_virtual_batches)
 
 from ..layer import Attention
-from .utils import create_custom_attention_backend
-from vllm.v1.attention.backends.utils import (
-    CommonAttentionMetadata, make_local_attention_virtual_batches)
-
 
 
 class ChunkedLocalAttention(Attention):
@@ -41,11 +40,12 @@ class ChunkedLocalAttention(Attention):
                                                        kv_cache_dtype,
                                                        block_size)
 
-            prefix = f"ChunkedLocalAttention_{attention_chunk_size}_{block_size}_"
+            prefix =\
+                f"ChunkedLocalAttention_{attention_chunk_size}_{block_size}_"
 
             def build_preprocess_fn(cm: CommonAttentionMetadata):
-                return make_local_attention_virtual_batches(attention_chunk_size, cm,
-                                                            block_size)
+                return make_local_attention_virtual_batches(
+                    attention_chunk_size, cm, block_size)
 
             attn_backend = create_custom_attention_backend(
                 prefix, underlying_attn_backend, build_preprocess_fn)

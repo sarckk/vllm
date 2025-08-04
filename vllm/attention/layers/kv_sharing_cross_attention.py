@@ -10,9 +10,10 @@ from vllm.attention.backends.abstract import AttentionBackend
 from vllm.attention.selector import get_attn_backend
 from vllm.config import CacheConfig, QuantizationConfig
 from vllm.v1.attention.backends.utils import (
-    CommonAttentionMetadata, make_local_attention_virtual_batches)
+    CommonAttentionMetadata, create_custom_attention_backend,
+    make_local_attention_virtual_batches)
+from vllm.v1.worker.utils import KVSharingFastPrefillAttentionBackend
 
-from .utils import create_custom_attention_backend
 from ..layer import Attention
 
 
@@ -21,7 +22,7 @@ def compute_fast_prefill_attn_metadata(
 ) -> CommonAttentionMetadata:
     if common_attn_metadata.max_query_len == 1:
         # All requests are decode (assume 1 token for now)
-        # Skip computing fast prefill path 
+        # Skip computing fast prefill path
         return common_attn_metadata
 
     logits_indices = common_attn_metadata.logits_indices
@@ -37,8 +38,8 @@ def compute_fast_prefill_attn_metadata(
     # Find how many decode indices belong to each request
     # request_ids: [0, 1, 1, 2]
     request_ids = torch.bucketize(logits_indices,
-                                    query_start_loc[1:],
-                                    right=True)
+                                  query_start_loc[1:],
+                                  right=True)
 
     # Figure out how many tokens are in each request
     # num_decode_tokens: [1, 2, 1]
@@ -47,8 +48,8 @@ def compute_fast_prefill_attn_metadata(
     # Calculate new query_start_loc with tokens in generation_indices
     # decode_query_start_loc: [0, 1, 3, 4]
     decode_query_start_loc = torch.empty(num_reqs + 1,
-                                            device=query_start_loc.device,
-                                            dtype=query_start_loc.dtype)
+                                         device=query_start_loc.device,
+                                         dtype=query_start_loc.dtype)
 
     decode_query_start_loc[0] = 0
     decode_query_start_loc[1:] = torch.cumsum(num_decode_tokens, dim=0)
@@ -71,6 +72,7 @@ def compute_fast_prefill_attn_metadata(
         causal=True,
     )
     return common_attn_metadata
+
 
 class KVSharingCrossAttention(Attention):
 
@@ -99,9 +101,9 @@ class KVSharingCrossAttention(Attention):
         else:
             kv_cache_dtype = "auto"
             block_size = 16
-        
+
         attention_chunk_size = \
-            extra_impl_args.get("attention_chunk_size", None)
+            extra_impl_args.get("attention_chunk_size")
 
         if envs.VLLM_USE_V1:
             underlying_attn_backend = get_attn_backend(head_size, dtype,
@@ -109,16 +111,11 @@ class KVSharingCrossAttention(Attention):
                                                        block_size)
 
             attn_metadata_builder_prefix = "KVSharing"
-            # TODO: check if fast prefill optimiztion path enabled
-            # 1) user guarantees that this is a valid fast prefill path 
-            # 2) Check that all requests on current iteration are decode?
-            #    Maybe by checking that length of tokens for each req all one?
-            fast_prefill = (
-                cache_config is not None 
-                and cache_config.kv_sharing_fast_prefill
-            )
 
-            if fast_prefill:
+            fast_prefill_enabled = (cache_config is not None
+                                    and cache_config.kv_sharing_fast_prefill)
+
+            if fast_prefill_enabled:
                 attn_metadata_builder_prefix += "FastPrefill"
             if attention_chunk_size is not None:
                 attn_metadata_builder_prefix += "ChunkedLocalAttention"
@@ -126,15 +123,24 @@ class KVSharingCrossAttention(Attention):
             def build_preprocess_fn(cm: CommonAttentionMetadata):
                 preprocessed_cm = cm
 
-                if fast_prefill:
+                if fast_prefill_enabled:
                     preprocessed_cm = compute_fast_prefill_attn_metadata(cm)
 
                 if attention_chunk_size is not None:
-                    preprocessed_cm = make_local_attention_virtual_batches(attention_chunk_size, cm, block_size)
+                    preprocessed_cm = make_local_attention_virtual_batches(
+                        attention_chunk_size, cm, block_size)
                 return preprocessed_cm
 
             attn_backend = create_custom_attention_backend(
-                attn_metadata_builder_prefix, underlying_attn_backend, build_preprocess_fn)
+                attn_metadata_builder_prefix,
+                underlying_attn_backend,
+                build_preprocess_fn,
+            )
+            assert attn_backend is not None
+            attn_backend = type(attn_backend.__name__, (
+                attn_backend,
+                type(KVSharingFastPrefillAttentionBackend),
+            ), {})
         else:
             attn_backend = None
 
