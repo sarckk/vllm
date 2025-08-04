@@ -19,6 +19,11 @@ from ..layer import Attention
 def compute_fast_prefill_attn_metadata(
     common_attn_metadata: CommonAttentionMetadata,
 ) -> CommonAttentionMetadata:
+    if common_attn_metadata.max_query_len == 1:
+        # All requests are decode (assume 1 token for now)
+        # Skip computing fast prefill path 
+        return common_attn_metadata
+
     logits_indices = common_attn_metadata.logits_indices
     num_reqs = common_attn_metadata.num_reqs
     query_start_loc = common_attn_metadata.query_start_loc

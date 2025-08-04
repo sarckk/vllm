@@ -576,6 +576,7 @@ def subclass_attention_metadata(
     return Wrapped
 
 
+@functools.cache
 def make_kv_sharing_fast_prefill_attention_metadata(
     metadata_cls: Any, ) -> Any:
     """

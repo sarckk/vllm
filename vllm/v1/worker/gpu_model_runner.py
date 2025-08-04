@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import dataclasses
+from dataclasses import fields
 import gc
 import itertools
 import time
@@ -873,8 +873,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     fast_prefill_metadata_type = (
                         make_kv_sharing_fast_prefill_attention_metadata(
                             metadata_cls=type(attn_metadata_i), ))
+                    # Avoid deepcopy caused by dict.asdict
+                    attn_metadata_fields = {}
+                    for field in fields(attn_metadata_i.__class__):
+                        attn_metadata_fields[field.name] = getattr(attn_metadata_i, field.name)
                     attn_metadata_i = fast_prefill_metadata_type(
-                        **dataclasses.asdict(attn_metadata_i),
+                        **attn_metadata_fields,
                         logits_indices_padded=logits_indices_padded,
                         num_logits_indices=logits_indices.size(0),
                     )
