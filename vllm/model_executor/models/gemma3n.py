@@ -552,6 +552,8 @@ class Gemma3nDecoder(nn.Module):
         per_layer_inputs: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        # [altnum_inputs, num_tokens, hidden_size]
+        hidden_states = hidden_states.permute(2, 0, 1)
         for idx, layer in enumerate(self.decoder_layers):
             layer_idx = idx + self.layer_idx_start
             # [altup_num_inputs, num_tokens, hidden_size]
@@ -561,6 +563,8 @@ class Gemma3nDecoder(nn.Module):
                 per_layer_input=per_layer_inputs[:, layer_idx, :],
                 **kwargs,
             )
+        # [num_tokens, hidden_size, altnum_inputs]
+        hidden_states = hidden_states.permute(1, 2, 0)
         return hidden_states
 
 @ignore_torch_compile
@@ -669,10 +673,9 @@ class Gemma3nTextModel(nn.Module):
         self.fast_prefill_enabled = (
             cache_config.kv_sharing_fast_prefill and envs.VLLM_USE_V1)
         
-        if self.fast_prefill_enabled:
-            # Let vLLM handle allocating and copying to static buffers
-            # required for CUDA graphs to work
-            vllm_config.compilation_config.cudagraph_copy_inputs = True
+        # Let vLLM handle allocating and copying to static buffers
+        # required for CUDA graphs to work
+        vllm_config.compilation_config.cudagraph_copy_inputs = True
             
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -731,7 +734,7 @@ class Gemma3nTextModel(nn.Module):
                                        keepdim=True)**0.5
             hidden_states[i] *= target_magnitude / torch.maximum(
                 new_magnitude, self.eps)
-        hidden_states = torch.stack(hidden_states, dim=0)
+        hidden_states = torch.stack(hidden_states, dim=-1)
 
         logits_indices_padded = None
         num_logits_indices = None
@@ -773,33 +776,33 @@ class Gemma3nTextModel(nn.Module):
 
         cross_decoder_hidden_states = self.cross_decoder(
             positions=positions[logits_indices_padded],
-            hidden_states=self_decoder_hidden_states[:, logits_indices_padded],
+            hidden_states=self_decoder_hidden_states[logits_indices_padded],
             per_layer_inputs=per_layer_inputs[logits_indices_padded],
             **kwargs,
         )
 
         # Merge cross-decoder hs back to self-decoder hs
         if num_logits_indices is not None:
-            hidden_states[:, logits_indices_padded[:num_logits_indices]] = (
-                cross_decoder_hidden_states[:, :num_logits_indices]
+            hidden_states[logits_indices_padded[:num_logits_indices]] = (
+                cross_decoder_hidden_states[:num_logits_indices]
             ) 
         else:
             hidden_states = cross_decoder_hidden_states
         
         # Altup unembed.
-        target_magnitude = torch.mean(hidden_states[0]**2,
+        target_magnitude = torch.mean(hidden_states[...,0]**2,
                                       dim=-1,
                                       keepdim=True)**0.5
         for i in range(1, self.config.altup_num_inputs):
-            hidden_states[i] = self.altup_unembed_projections[i - 1](
-                hidden_states[i])
-            new_magnitude = torch.mean(hidden_states[i]**2,
+            hidden_states[...,i] = self.altup_unembed_projections[i - 1](
+                hidden_states[...,i])
+            new_magnitude = torch.mean(hidden_states[...,i]**2,
                                        dim=-1,
                                        keepdim=True)**0.5
-            hidden_states[i] *= target_magnitude / torch.maximum(
+            hidden_states[...,i] *= target_magnitude / torch.maximum(
                 new_magnitude, self.eps)
-        # [altup_num_inputs,num_tokens,hidden_size] -> [num_tokens,hidden_size]
-        hidden_states = torch.mean(hidden_states, dim=0)
+        # [num_tokens,hidden_size, altup_num_inputs] -> [num_tokens,hidden_size]
+        hidden_states = torch.mean(hidden_states, dim=-1)
 
         return self.norm(hidden_states)
 
