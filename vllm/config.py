@@ -4391,7 +4391,9 @@ class CompilationConfig:
         if isinstance(self.pass_config, dict):
             self.pass_config = PassConfig(**self.pass_config)
 
-    def init_backend(self, vllm_config: "VllmConfig") -> Union[str, Callable]:
+    def init_backend(self,
+        vllm_config: "VllmConfig",
+        dynamic_arg_dims: Optional[dict[str, Union[int, list[int]]]] = None) -> Union[str, Callable]:
         if self.level == CompilationLevel.NO_COMPILATION:
             raise ValueError("No compilation level is set.")
 
@@ -4411,7 +4413,9 @@ class CompilationConfig:
         assert self.level == CompilationLevel.PIECEWISE
 
         from vllm.compilation.backends import VllmBackend
-        return VllmBackend(vllm_config)
+        return VllmBackend(
+            vllm_config=vllm_config,
+            dynamic_arg_dims=dynamic_arg_dims)
 
     def init_with_cudagraph_sizes(self,
                                   cudagraph_capture_sizes: list[int]) -> None:

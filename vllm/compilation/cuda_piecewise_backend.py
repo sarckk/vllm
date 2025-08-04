@@ -204,7 +204,7 @@ class CUDAPiecewiseBackend:
             # manage the memory during cuda graph capture
             return output
 
-        if self.is_debugging_mode:
+        if True:
             # check if the input addresses are the same
             new_input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)

@@ -6,7 +6,7 @@ import sys
 from abc import abstractmethod
 from contextlib import contextmanager
 from types import CodeType
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import torch
 
@@ -32,7 +32,9 @@ class TorchCompileWrapperWithCustomDispatcher:
 
     def __init__(self,
                  compiled_callable: Optional[Callable] = None,
-                 compilation_level: int = 0):
+                 compilation_level: int = 0,
+                 dynamic_arg_dims: Optional[dict[str, Union[int, list[int]]]] = None,
+                 ):
 
         vllm_config = get_current_vllm_config()
         self.vllm_config = vllm_config
@@ -40,7 +42,7 @@ class TorchCompileWrapperWithCustomDispatcher:
             # default compilation settings
             # compiling the forward method
 
-            backend = vllm_config.compilation_config.init_backend(vllm_config)
+            backend = vllm_config.compilation_config.init_backend(vllm_config, dynamic_arg_dims)
             options = None
             if isinstance(backend, str) and backend == "inductor":
                 options = get_current_vllm_config(

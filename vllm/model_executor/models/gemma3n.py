@@ -23,7 +23,8 @@ from torch import nn
 from transformers.models.gemma3n.configuration_gemma3n import Gemma3nTextConfig
 
 from vllm.attention import Attention
-from vllm.compilation.decorators import support_torch_compile
+from vllm.compilation.decorators import ignore_torch_compile, support_torch_compile
+from vllm.compilation.backends import set_model_tag
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -532,9 +533,45 @@ class Gemma3nDecoderLayer(nn.Module):
         return corrected_predictions
 
 
-@support_torch_compile
-class Gemma3nTextModel(nn.Module, SupportsQuant):
+@support_torch_compile(
+    dynamic_arg_dims={
+        "positions": 0,
+        "hidden_states": 1,
+        "per_layer_inputs": 0,
+    }
+)
+class Gemma3nDecoder(nn.Module):
+    def __init__(
+        self, *, 
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        decoder_layers: list[Gemma3nDecoderLayer], 
+        layer_idx_start: int, 
+    ):
+        super().__init__()
+        self.decoder_layers = decoder_layers
+        self.layer_idx_start = layer_idx_start
 
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        per_layer_inputs: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        for idx, layer in enumerate(self.decoder_layers):
+            layer_idx = idx + self.layer_idx_start
+            # [altup_num_inputs, num_tokens, hidden_size]
+            hidden_states = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                per_layer_input=per_layer_inputs[:, layer_idx, :],
+                **kwargs,
+            )
+        return hidden_states
+
+@ignore_torch_compile
+class Gemma3nTextModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config.text_config
@@ -542,6 +579,7 @@ class Gemma3nTextModel(nn.Module, SupportsQuant):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
+        vllm_config.compilation_config.cudagraph_copy_inputs = True
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -611,6 +649,26 @@ class Gemma3nTextModel(nn.Module, SupportsQuant):
             lambda prefix: Gemma3nDecoderLayer(
                 config, cache_config, quant_config, prefix=prefix),
             prefix=f"{prefix}.layers")
+
+        first_kv_shared_layer_idx = (config.num_hidden_layers -
+                                     config.num_kv_shared_layers)
+        # Layer idx 0-19 are self-decoder layers in You Only Cache Once (YOCO)
+        with set_model_tag("self_decoder"):
+            self.self_decoder = Gemma3nDecoder(
+                vllm_config=vllm_config,
+                prefix=f"{prefix}.self_decoder",
+                decoder_layers=self.layers[:first_kv_shared_layer_idx],
+                layer_idx_start=0,
+            )
+        # Layer idx 20-30 are cross-decoder layers in YOCO
+        with set_model_tag("cross_decoder"):
+            self.cross_decoder = Gemma3nDecoder(
+                vllm_config=vllm_config,
+                prefix=f"{prefix}.cross_decoder",
+                decoder_layers=self.layers[first_kv_shared_layer_idx:],
+                layer_idx_start=first_kv_shared_layer_idx,
+            )
+
         self.norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
@@ -675,15 +733,19 @@ class Gemma3nTextModel(nn.Module, SupportsQuant):
                 new_magnitude, self.eps)
         hidden_states = torch.stack(hidden_states, dim=0)
 
-        # Transformer blocks.
-        for layer_idx, layer in enumerate(self.layers):
-            # [altup_num_inputs, num_tokens, hidden_size]
-            hidden_states = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                per_layer_input=per_layer_inputs[:, layer_idx, :],
-                **kwargs,
-            )
+        self_decoder_hidden_states = self.self_decoder(
+            positions=positions,
+            hidden_states=hidden_states,
+            per_layer_inputs=per_layer_inputs,
+            **kwargs,
+        )
+
+        hidden_states = self.cross_decoder(
+            positions=positions,
+            hidden_states=self_decoder_hidden_states,
+            per_layer_inputs=per_layer_inputs,
+            **kwargs,
+        )
 
         # Altup unembed.
         target_magnitude = torch.mean(hidden_states[0]**2,

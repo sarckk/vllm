@@ -8,7 +8,7 @@ import pprint
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 import torch
 import torch.fx as fx
@@ -399,10 +399,13 @@ class VllmBackend:
     input_buffers: list[torch.Tensor]
     compiler_manager: CompilerManager
 
+    dynamic_arg_dims_list: Optional[list[int]] = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
+        dynamic_arg_dims: Optional[dict[str, Union[int, list[int]]]] = None,
     ):
 
         # if the model is initialized with a non-empty prefix,
@@ -430,6 +433,9 @@ class VllmBackend:
 
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
+
+        self.dynamic_arg_dims_list = (
+            list(dynamic_arg_dims.values()) if dynamic_arg_dims is not None else None)
 
         self.compiler_manager: CompilerManager = CompilerManager(
             self.compilation_config)
@@ -619,8 +625,20 @@ class VllmBackend:
             list_args = list(args)
             for i, index in enumerate(self.sym_tensor_indices):
                 runtime_tensor = list_args[index]
-                runtime_shape = runtime_tensor.shape[0]
-                static_tensor = self.input_buffers[i][:runtime_shape]
+                # By default, dynamic dim is 0
+                dynamic_dim = 0
+                if self.dynamic_arg_dims_list is not None:
+                    dynamic_dim = self.dynamic_arg_dims_list[i]
+                runtime_shape = runtime_tensor.shape[dynamic_dim]
+                if dynamic_dim == 0 or self.input_buffers[i].ndim == 1:
+                    static_tensor = self.input_buffers[i][:runtime_shape]
+                else:
+                    if dynamic_dim < 0:
+                        # Take last dim
+                        dynamic_dim = self.input_buffers[i].ndim - 1
+                    slice_indices = (slice(None),) * dynamic_dim
+                    # .contiguous() gets around stride guard but causes issues with cudagraphs
+                    static_tensor = self.input_buffers[i][*slice_indices,:runtime_shape]
 
                 # copy the tensor to the static buffer
                 static_tensor.copy_(runtime_tensor)
