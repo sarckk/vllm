@@ -65,10 +65,19 @@ def support_torch_compile(cls: _T) -> _T:
     ...
 
 
+@overload
+def support_torch_compile(
+    *,
+    if_satisfied: Optional[Callable[[VllmConfig], bool]] = None,
+) -> Callable[[_T], _T]:
+    ...
+
+
 def support_torch_compile(
     cls: Optional[_T] = None,
     *,
     dynamic_arg_dims: Optional[dict[str, Union[int, list[int]]]] = None,
+    if_satisfied: Optional[Callable[[VllmConfig], bool]] = None,
 ) -> Union[Callable[[_T], _T], _T]:
     """
     A decorator to add support for compiling the forward method of a class.
@@ -149,7 +158,8 @@ def support_torch_compile(
             if k not in sig.parameters:
                 raise ValueError(
                     f"Argument {k} not found in the forward method of {cls}")
-        return _support_torch_compile(cls, inferred_dynamic_arg_dims)
+        return _support_torch_compile(cls, inferred_dynamic_arg_dims,
+                                      if_satisfied)
 
     if cls is not None:
         # use `support_torch_compile` as a decorator without arguments
@@ -162,6 +172,7 @@ def support_torch_compile(
 def _support_torch_compile(
     cls: _T,
     dynamic_arg_dims: dict[str, Union[int, list[int]]],
+    if_satisfied: Optional[Callable[[VllmConfig], bool]] = None,
 ) -> _T:
     """
     A decorator to add support for compiling the forward method of a class.
@@ -187,8 +198,10 @@ def _support_torch_compile(
         self.do_not_compile = \
             vllm_config.compilation_config.level in [
             CompilationLevel.NO_COMPILATION, CompilationLevel.DYNAMO_AS_IS
-        ] or not supports_dynamo() or _should_ignore_torch_compile(
-            self.__class__)
+        ] or not supports_dynamo() or (
+            _should_ignore_torch_compile(self.__class__)
+            or (if_satisfied is not None and not if_satisfied(vllm_config)))
+
         if self.do_not_compile:
             return
 

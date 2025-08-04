@@ -27,8 +27,7 @@ from vllm.attention import Attention
 from vllm.attention.layers.kv_sharing_cross_attention import (
     KVSharingCrossAttention)
 from vllm.compilation.backends import set_model_tag
-from vllm.compilation.decorators import (ignore_torch_compile,
-                                         support_torch_compile)
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
@@ -58,6 +57,11 @@ from .utils import (AutoWeightsLoader, extract_layer_index,
                     is_pp_missing_parameter, make_layers, maybe_prefix)
 
 logger = init_logger(__name__)
+
+
+def kv_sharing_fast_prefill_enabled(vllm_config: VllmConfig) -> bool:
+    return (vllm_config.cache_config.kv_sharing_fast_prefill
+            and envs.VLLM_USE_V1)
 
 
 class Gemma3nAltUp(nn.Module):
@@ -536,7 +540,8 @@ class Gemma3nDecoderLayer(nn.Module):
         return corrected_predictions
 
 
-@support_torch_compile
+# This enables torch.compile if --kv-sharing-fast-prefill passed
+@support_torch_compile(if_satisfied=kv_sharing_fast_prefill_enabled)
 class Gemma3nDecoder(nn.Module):
 
     def __init__(
@@ -574,7 +579,9 @@ class Gemma3nDecoder(nn.Module):
         return hidden_states
 
 
-@ignore_torch_compile
+# This disables torch.compile if --kv-sharing-fast-prefill passed
+@support_torch_compile(if_satisfied=lambda vllm_config:
+                       not kv_sharing_fast_prefill_enabled(vllm_config))
 class Gemma3nTextModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -677,8 +684,8 @@ class Gemma3nTextModel(nn.Module):
         )
         self.eps = torch.tensor(torch.finfo().min)
 
-        self.fast_prefill_enabled = (cache_config.kv_sharing_fast_prefill
-                                     and envs.VLLM_USE_V1)
+        self.fast_prefill_enabled = kv_sharing_fast_prefill_enabled(
+            vllm_config)
 
         # Let vLLM handle allocating and copying to static buffers
         # required for CUDA graphs to work
