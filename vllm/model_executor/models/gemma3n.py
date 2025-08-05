@@ -686,10 +686,27 @@ class Gemma3nTextModel(nn.Module):
 
         self.fast_prefill_enabled = kv_sharing_fast_prefill_enabled(
             vllm_config)
-
+        
         # Let vLLM handle allocating and copying to static buffers
         # required for CUDA graphs to work
         vllm_config.compilation_config.cudagraph_copy_inputs = True
+        if self.fast_prefill_enabled:
+            # Allocate buffers for positions, hidden_states and  
+            max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            device = next(self.parameters()).device
+            self.positions = torch.zeros(max_num_tokens,
+                                        dtype=torch.int64,
+                                        device=device)
+            self.hidden_states = torch.zeros(
+                (max_num_tokens, config.hidden_size, self.config.altup_num_inputs),
+                dtype=self.embed_tokens.weight.dtype,
+                device=device,
+            )
+            self.per_layer_inputs = torch.zeros(
+                (max_num_tokens, self.config.num_hidden_layers, self.config.hidden_size_per_layer_input),
+                dtype=self.embed_tokens.weight.dtype,
+                device=device,
+            )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids) * self.embed_scale
@@ -764,10 +781,15 @@ class Gemma3nTextModel(nn.Module):
                     layer_attn_metadata.logits_indices_padded)
                 num_logits_indices = layer_attn_metadata.num_logits_indices
 
+        # Copy inputs for cudagraph
+        batch_size = positions.size(0)
+        self.positions[:batch_size].copy_(positions)
+        self.hidden_states[:batch_size].copy_(hidden_states)
+        self.per_layer_inputs[:batch_size].copy_(per_layer_inputs)
         self_decoder_hidden_states = self.self_decoder(
-            positions=positions,
-            hidden_states=hidden_states,
-            per_layer_inputs=per_layer_inputs,
+            positions=self.positions[:batch_size],
+            hidden_states=self.hidden_states[:batch_size],
+            per_layer_inputs=self.per_layer_inputs[:batch_size],
             **kwargs,
         )
 
@@ -777,19 +799,24 @@ class Gemma3nTextModel(nn.Module):
                 dtype=positions.dtype,
                 device=positions.device,
             )
-
-        # NOTE(sarckk): IMPORTANT! Because vLLM shares a single graph pool
-        # among all CUDA graph captures, self_decoder_hidden_states
-        # will sometimes have its memory partially overriden by the cross
-        # decoder layer cuda graph replays as PyTorch tries to reuse memory
-        # .clone() here explicitly allocates new memory for these tensors
-        # so they are not overriden in the cross-decoder forward below.
+        
         hidden_states = self_decoder_hidden_states.clone()
-
+        
+        # Copy inputs for cudagraph
+        num_padded_logits_indices = logits_indices_padded.size(0)
+        self.positions[:num_padded_logits_indices].copy_(
+            positions[logits_indices_padded]
+        )
+        self.hidden_states[:num_padded_logits_indices].copy_(
+            self_decoder_hidden_states[logits_indices_padded]
+        )
+        self.per_layer_inputs[:num_padded_logits_indices].copy_(
+            per_layer_inputs[logits_indices_padded]
+        )
         cross_decoder_hidden_states = self.cross_decoder(
-            positions=positions[logits_indices_padded],
-            hidden_states=self_decoder_hidden_states[logits_indices_padded],
-            per_layer_inputs=per_layer_inputs[logits_indices_padded],
+            positions=self.positions[:num_padded_logits_indices],
+            hidden_states=self.hidden_states[:num_padded_logits_indices],
+            per_layer_inputs=self.per_layer_inputs[:num_padded_logits_indices],
             **kwargs,
         )
 
