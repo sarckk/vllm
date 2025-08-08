@@ -1917,6 +1917,7 @@ class CacheConfig:
 
         self._verify_cache_dtype()
         self._verify_prefix_caching()
+        self._verify_kv_sharing_fast_prefill()
 
     def metrics_info(self):
         # convert cache_config to dict(key: str, value: str) for prometheus
@@ -1934,11 +1935,6 @@ class CacheConfig:
                 "GPU memory utilization must be less than 1.0. Got "
                 f"{self.gpu_memory_utilization}.")
 
-        if self.kv_sharing_fast_prefill:
-            logger.warning_once(
-                "--kv-sharing-fast-prefill is currently work in progress "
-                "and not functional yet (i.e. no prefill savings)")
-
         return self
 
     def _verify_cache_dtype(self) -> None:
@@ -1952,6 +1948,12 @@ class CacheConfig:
                 "scaling factor.")
         else:
             raise ValueError(f"Unknown kv cache dtype: {self.cache_dtype}")
+
+    def _verify_kv_sharing_fast_prefill(self) -> None:
+        if self.kv_sharing_fast_prefill and not envs.VLLM_USE_V1:
+            raise NotImplementedError(
+                "Fast prefill optimization for KV sharing is not supported "
+                "in V0 currently.")
 
     def _verify_prefix_caching(self) -> None:
         if not self.enable_prefix_caching:
