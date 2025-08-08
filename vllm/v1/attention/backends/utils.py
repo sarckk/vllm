@@ -764,17 +764,28 @@ def subclass_attention_metadata(
     return Wrapped
 
 
-@functools.cache
+@functools.lru_cache
 def make_kv_sharing_fast_prefill_attention_metadata(
     metadata_cls: Hashable, ) -> Any:
     """
     Return a new subclass of `metadata_cls` for fast prefill
     """
-    return subclass_attention_metadata(
+    attn_metadata_dataclass = subclass_attention_metadata(
         name_prefix="KVSharingFastPrefill",
         metadata_cls=metadata_cls,
         fields=KV_SHARING_FAST_PREFILL_METADATA_FIELDS,
     )
+    # Make attention metadata type inherit
+    # KVSharingFastPrefillAttentionMetadata type
+    fast_prefill_metadata_type = type(
+        attn_metadata_dataclass.__name__,
+        (
+            attn_metadata_dataclass,
+            KVSharingFastPrefillAttentionMetadata,
+        ),
+        {},
+    )
+    return fast_prefill_metadata_type
 
 
 @runtime_checkable
@@ -794,18 +805,7 @@ def create_kv_sharing_fast_prefill_attn_metadata_subclass(
     # which are required for prefill truncation
     fast_prefill_metadata_type = (
         make_kv_sharing_fast_prefill_attention_metadata(
-            metadata_cls=type(attn_metadata_i), ))
-
-    # Make attention metadata type inherit
-    # KVSharingFastPrefillAttentionMetadata type
-    fast_prefill_metadata_type = type(
-        fast_prefill_metadata_type.__name__,
-        (
-            fast_prefill_metadata_type,
-            KVSharingFastPrefillAttentionMetadata,
-        ),
-        {},
-    )
+            metadata_cls=type(attn_metadata_i), ))  # type: ignore
     # Avoid deepcopy caused by dict.asdict
     attn_metadata_fields = {}
     for field in fields(attn_metadata_i.__class__):
