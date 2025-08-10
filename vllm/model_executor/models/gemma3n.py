@@ -1093,7 +1093,7 @@ class Gemma3nForConditionalGeneration(nn.Module, SupportsQuant):
         self.logits_processor = LogitsProcessor(
             config.text_config.vocab_size,
             soft_cap=config.text_config.final_logit_softcapping)
-    
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.language_model.get_input_embeddings(input_ids)
 

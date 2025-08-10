@@ -802,6 +802,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if attn_module.attn_type == AttentionType.ENCODER_ONLY:
                     attn_metadata[layer_name] = encoder_attn_metadata
 
+        if (self.cache_config.kv_sharing_fast_prefill
+                and self.input_batch.num_prompt_logprobs):
+            logger.warning_once(
+                "Encountered at least one request with prompt_logprobs set "
+                "with --kv-sharing-fast-prefill enabled. Fast prefill doesn't "
+                "produce correct logits for prompt tokens, so fast prefill "
+                "will be disabled for scheduling rounds with prompt_logprobs.")
+
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
@@ -827,7 +835,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 max_query_len=max_num_scheduled_tokens,
                 block_table_tensor=blk_table_tensor,
                 slot_mapping=slot_mapping,
-                logits_indices=logits_indices,
                 causal=True,
             )
 
@@ -848,15 +855,27 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         builder,
                     )
 
+                # If there is at least one request with prompt_logprobs set,
+                # we cannot enable this optimization as the logits of prompt
+                # tokens will no longer be valid when doing  fast prefill.
+                is_fast_prefill = (
+                    attn_group.layer_names[0]
+                    in self.kv_sharing_fast_prefill_eligible_layers
+                    and not self.input_batch.num_prompt_logprobs)
+                if is_fast_prefill:
+                    # If logits_indices is set, builder.build(...) will
+                    # preprocess the common metadata to skip prefill tokens
+                    common_attn_metadata.logits_indices = logits_indices
+                    # TODO(sarckk): Enable cascade attention for fast prefill
+                    common_prefix_len = 0
+
                 attn_metadata_i = (builder.build(
                     common_prefix_len=common_prefix_len,
                     common_attn_metadata=common_attn_metadata,
                 ))
 
-                if attn_group.layer_names[
-                        0] in self.kv_sharing_fast_prefill_eligible_layers:
-                    # For these layers we need extra metadata to be used in
-                    # the model implementation
+                if is_fast_prefill:
+                    # Eligible layers need extra metadata for use in the model.
                     attn_metadata_i = \
                         create_kv_sharing_fast_prefill_attn_metadata_subclass(
                             attn_metadata_i,

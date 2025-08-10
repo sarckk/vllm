@@ -547,7 +547,12 @@ def make_kv_sharing_fast_prefill_common_attn_metadata(
         # Skip computing fast prefill path
         return common_attn_metadata
 
-    assert common_attn_metadata.logits_indices is not None
+    if common_attn_metadata.logits_indices is None:
+        # Logits_indices can be None if prompt_logprobs is
+        # set for at least one request in the current iteration
+        # fast prefill is not compatible with prompt_logprobs
+        # so skip computing fast prefill path
+        return common_attn_metadata
 
     logits_indices = common_attn_metadata.logits_indices
     num_reqs = common_attn_metadata.num_reqs
