@@ -380,7 +380,7 @@ def infer_global_hyperparameters(
 
 
 #
-# Take in `query_start_loc_np` and `seq_lens_np` and break the sequences into
+# Take in `query_start_loc_cpu` and `seq_lens_cpu` and break the sequences into
 # local attention blocks, where each block is passed to the attention kernel
 # as an independent local ("virtual") batch item.
 #
@@ -424,7 +424,7 @@ def infer_global_hyperparameters(
 #
 # e.g. if we have:
 #   attn_chunk_size = 4
-#   query_start_loc_np = [0, 4, 14, 19] (q_seqlens = [4, 10, 5])
+#   query_start_loc_cpu = [0, 4, 14, 19] (q_seqlens = [4, 10, 5])
 # Then this function would return:
 #                           __b0__  ______b1______  __b2__ < orig batch indices
 #   q_seqlens_local    = [   2,  2,  1,  4,  4,  1,  4,  1]
@@ -436,13 +436,13 @@ def make_local_attention_virtual_batches(
     common_attn_metadata: CommonAttentionMetadata,
     block_size: int = 0,
 ) -> CommonAttentionMetadata:
-    query_start_loc_np = common_attn_metadata.query_start_loc_cpu.numpy()
-    seq_lens_np = common_attn_metadata.seq_lens_cpu.numpy()
+    query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+    seq_lens_cpu = common_attn_metadata.seq_lens_cpu
     block_table = common_attn_metadata.block_table_tensor
     device = common_attn_metadata.query_start_loc.device
 
-    q_seqlens = query_start_loc_np[1:] - query_start_loc_np[:-1]
-    actual_batch_size = seq_lens_np.shape[0]
+    q_seqlens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+    actual_batch_size = seq_lens_cpu.shape[0]
 
     # Handle if we are starting in the middle of a local attention block,
     #  we assume q_seqlens > 0 (for all elements), for each batch idx we compute
@@ -455,10 +455,10 @@ def make_local_attention_virtual_batches(
     # Then we would get:
     #   new_tokens_in_first_block = [2, 1, 4]
     #   local_blocks = [2, 4, 2]
-    q_tokens_in_first_block = np.minimum(
-        attn_chunk_size - ((seq_lens_np - q_seqlens) % attn_chunk_size),
-        q_seqlens).astype(np.int32)
-    tokens_in_last_block = attn_chunk_size + (seq_lens_np % -attn_chunk_size)
+    q_tokens_in_first_block = torch.minimum(
+        attn_chunk_size - ((seq_lens_cpu - q_seqlens) % attn_chunk_size),
+        q_seqlens).to(torch.int32)
+    tokens_in_last_block = attn_chunk_size + (seq_lens_cpu % -attn_chunk_size)
     local_blocks = 1 + cdiv(q_seqlens - q_tokens_in_first_block,
                             attn_chunk_size)
 
@@ -471,28 +471,30 @@ def make_local_attention_virtual_batches(
     # First Get batched arange. (E.g., [2, 4, 2] -> [0, 1, 0, 1, 2, 3, 0, 1])
     #   (TODO: max a utility to share this code with _prepare_inputs)
     # arange step 1. [2, 4, 2] -> [2, 6, 8]
-    cu_num_blocks = np.cumsum(local_blocks)
-    virtual_batches = cu_num_blocks[-1]
+    cu_num_blocks = torch.cumsum(local_blocks, dim=0).to(torch.int32)
+    virtual_batches = cu_num_blocks[-1].item()
     # arange step 2. [2, 6, 8] -> [0, 0, 2, 2, 2, 2, 6, 6]
-    block_offsets = np.repeat(cu_num_blocks - local_blocks, local_blocks)
+    block_offsets = torch.repeat_interleave(cu_num_blocks - local_blocks,
+                                            local_blocks)
     # arange step 3. [0, 1, 0, 1, 2, 3, 0, 1]
-    arange = np.arange(virtual_batches, dtype=np.int32) - block_offsets
+    arange = torch.arange(virtual_batches, dtype=torch.int32) - block_offsets
     # also compute reverse arange (i.e. [1, 0, 3, 2, 1, 0, 1, 0])
-    rarange = np.repeat(local_blocks, local_blocks) - arange - 1
+    rarange = torch.repeat_interleave(local_blocks, local_blocks) - arange - 1
     # Then we can compute the seqlens_q_local, handling the fact that the
     #  first and last blocks could be partial
     seqlens_q_local = \
-        np.repeat(q_seqlens - q_tokens_in_first_block, local_blocks)
+        torch.repeat_interleave(
+            q_seqlens - q_tokens_in_first_block, local_blocks)
     # set the first block since this may be a partial block
     seqlens_q_local[arange == 0] = q_tokens_in_first_block
     # set the remaining blocks
-    seqlens_q_local[arange > 0] = np.minimum(
+    seqlens_q_local[arange > 0] = torch.minimum(
         seqlens_q_local - attn_chunk_size * (arange - 1),
-        attn_chunk_size)[arange > 0]
+        torch.tensor(attn_chunk_size, dtype=seqlens_q_local.dtype))[arange > 0]
 
     # convert from q_seqlens to cu_seqlens_q
-    cu_seqlens_q_local = np.empty(virtual_batches + 1, dtype=np.int32)
-    np.cumsum(seqlens_q_local, out=cu_seqlens_q_local[1:])
+    cu_seqlens_q_local = torch.empty(virtual_batches + 1, dtype=torch.int32)
+    torch.cumsum(seqlens_q_local, dim=0, out=cu_seqlens_q_local[1:])
     cu_seqlens_q_local[0] = 0
 
     # compute the seqlens_k_local,
@@ -500,15 +502,16 @@ def make_local_attention_virtual_batches(
     #  batch
     # For our example this will be:
     #   seqlens_k_local = [4, 2, 4, 4, 4, 1, 4, 1]
-    seqlens_k_local = np.full(cu_num_blocks[-1],
-                              attn_chunk_size,
-                              dtype=np.int32)
+    seqlens_k_local = torch.full((virtual_batches, ),
+                                 attn_chunk_size,
+                                 dtype=torch.int32)
     seqlens_k_local[cu_num_blocks - 1] = tokens_in_last_block
     num_computed_tokens_local = seqlens_k_local - seqlens_q_local
 
-    k_seqstarts_absolute = np.repeat(seq_lens_np, local_blocks) - \
+    k_seqstarts_absolute = torch.repeat_interleave(
+        seq_lens_cpu, local_blocks) - \
         (rarange * attn_chunk_size + \
-            np.repeat(tokens_in_last_block, local_blocks))
+            torch.repeat_interleave(tokens_in_last_block, local_blocks))
     # For the example the local attention blocks start at:
     #                           _b0_  _____b1_____  _b2_
     #   k_seqstarts_absolute = [0, 4, 4, 8, 12, 16, 4, 8]
@@ -537,26 +540,24 @@ def make_local_attention_virtual_batches(
     #     [ 24, 25 ], < local-batch 7, (batch 2, starting from k[8])
     #   ]
     block_indices = (block_starts[:, None] +
-                     np.arange(pages_per_local_batch, dtype=np.int32))
+                     torch.arange(pages_per_local_batch, dtype=torch.int32))
     block_indices = block_indices.reshape(-1).clip(max=block_table.shape[1] -
                                                    1)
-    batch_indices = np.repeat(np.arange(actual_batch_size, dtype=np.int32),
-                              local_blocks * pages_per_local_batch)
+    batch_indices = torch.repeat_interleave(
+        torch.arange(actual_batch_size, dtype=torch.int32),
+        local_blocks * pages_per_local_batch)
+
     block_table_local = block_table[batch_indices, block_indices]\
         .view(virtual_batches, -1)
-
-    query_start_loc_cpu = torch.from_numpy(cu_seqlens_q_local)
-    seq_lens_cpu = torch.from_numpy(seqlens_k_local)
-    max_seq_len = int(seq_lens_cpu.max())
-
+    max_seq_len = int(seqlens_k_local.max())
     return CommonAttentionMetadata(
-        query_start_loc_cpu=query_start_loc_cpu,
-        query_start_loc=query_start_loc_cpu.to(device=device,
-                                               non_blocking=True),
-        seq_lens_cpu=seq_lens_cpu,
-        seq_lens=seq_lens_cpu.to(device=device, non_blocking=True),
-        num_computed_tokens_cpu=torch.from_numpy(num_computed_tokens_local),
-        num_reqs=len(seq_lens_cpu),
+        query_start_loc_cpu=cu_seqlens_q_local,
+        query_start_loc=cu_seqlens_q_local.to(device=device,
+                                              non_blocking=True),
+        seq_lens_cpu=seqlens_k_local,
+        seq_lens=seqlens_k_local.to(device=device, non_blocking=True),
+        num_computed_tokens_cpu=num_computed_tokens_local,
+        num_reqs=len(seqlens_k_local),
         num_actual_tokens=common_attn_metadata.num_actual_tokens,
         max_query_len=seqlens_q_local.max(),
         max_seq_len=max_seq_len,
